@@ -1,0 +1,9 @@
+app:
+  xlsx_path: data/test.xlsx
+  threshold: 0.3
+  ntfy_url: ntfy.sh/jijin_562877716
+funds:
+- 005827
+- '161005'
+- '163417'
+- '519069'
