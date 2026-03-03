@@ -6,6 +6,9 @@ on:
     # UTC 13:30 = 北京时间 21:30；仅周一~周五触发
     - cron: "30 13 * * 1-5"
 
+permissions:
+  contents: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
