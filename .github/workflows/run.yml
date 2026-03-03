@@ -1,0 +1,82 @@
+﻿name: Run Jijin
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 13 * * 1-5"   # UTC 13:30 = 北京时间 21:30
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check China holiday (skip if off day)
+        id: cn_day_check
+        run: |
+          python - <<'PY'
+          import json, urllib.request
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          # 以北京时间计算“今天”
+          now_cn = datetime.now(ZoneInfo("Asia/Shanghai"))
+          today = now_cn.date().isoformat()
+          weekday = now_cn.isoweekday()  # 1=Mon ... 7=Sun
+
+          # 周末永远不跑（即使是调休补班）
+          if weekday >= 6:
+            print("Weekend in China -> skip")
+            open("skip.txt","w",encoding="utf-8").write("true")
+            return
+
+          year = now_cn.year
+          url = f"https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/{year}.json"
+          data = json.load(urllib.request.urlopen(url, timeout=15))
+
+          off = False
+          for d in data.get("days", []):
+            if d.get("date") == today:
+              off = bool(d.get("isOffDay"))
+              name = d.get("name")
+              break
+          else:
+            name = None
+
+          if off:
+            print(f"{today} is statutory off day: {name} -> skip")
+            open("skip.txt","w",encoding="utf-8").write("true")
+          else:
+            print(f"{today} is OK -> run")
+            open("skip.txt","w",encoding="utf-8").write("false")
+          PY
+
+          echo "skip=$(cat skip.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Run jijin job
+        if: steps.cn_day_check.outputs.skip != 'true'
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+        run: |
+          python jijin.py --config config/funds.yaml
+
+      - name: Upload output
+        if: steps.cn_day_check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jijin-output
+          path: |
+            data/*.xlsx
+          if-no-files-found: warn
