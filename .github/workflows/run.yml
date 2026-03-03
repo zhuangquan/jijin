@@ -3,7 +3,8 @@
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 13 * * 1-5"   # UTC 13:30 = 北京时间 21:30
+    # UTC 13:30 = 北京时间 21:30；仅周一~周五触发
+    - cron: "30 13 * * 1-5"
 
 jobs:
   run:
@@ -17,50 +18,62 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Check China holiday (skip if off day)
+      # 判断：北京时间 周末永远跳过；工作日若为法定休息日也跳过
+      - name: Check China calendar (skip weekends & statutory holidays)
         id: cn_day_check
+        shell: bash
         run: |
           python - <<'PY'
           import json, urllib.request
           from datetime import datetime
           from zoneinfo import ZoneInfo
 
-          # 以北京时间计算“今天”
           now_cn = datetime.now(ZoneInfo("Asia/Shanghai"))
           today = now_cn.date().isoformat()
           weekday = now_cn.isoweekday()  # 1=Mon ... 7=Sun
 
-          # 周末永远不跑（即使是调休补班）
+          skip = False
+
+          # 周末永不运行（即使调休补班）
           if weekday >= 6:
-            print("Weekend in China -> skip")
-            open("skip.txt","w",encoding="utf-8").write("true")
-            return
-
-          year = now_cn.year
-          url = f"https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/{year}.json"
-          data = json.load(urllib.request.urlopen(url, timeout=15))
-
-          off = False
-          for d in data.get("days", []):
-            if d.get("date") == today:
-              off = bool(d.get("isOffDay"))
-              name = d.get("name")
-              break
+              print(f"[CN] {today} weekday={weekday} -> weekend, skip")
+              skip = True
           else:
-            name = None
+              year = now_cn.year
+              url = f"https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/{year}.json"
+              print(f"[CN] Fetch holiday data: {url}")
 
-          if off:
-            print(f"{today} is statutory off day: {name} -> skip")
-            open("skip.txt","w",encoding="utf-8").write("true")
-          else:
-            print(f"{today} is OK -> run")
-            open("skip.txt","w",encoding="utf-8").write("false")
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as resp:
+                      data = json.load(resp)
+              except Exception as e:
+                  # 拉取失败时的策略：为了不误报/不误跑，你可以改成 skip=True
+                  print(f"[CN] WARNING: failed to fetch holiday data: {e}. Default: NOT skipping.")
+                  data = {}
+
+              # 若今天在数据里标记为法定休息日(isOffDay=true)，则跳过
+              for d in data.get("days", []):
+                  if d.get("date") == today:
+                      if bool(d.get("isOffDay")):
+                          print(f"[CN] {today} is statutory off day: {d.get('name')} -> skip")
+                          skip = True
+                      else:
+                          print(f"[CN] {today} marked as working day: {d.get('name')}")
+                      break
+              else:
+                  print(f"[CN] {today} not found in dataset -> treat as normal weekday")
+
+          print(f"[CN] skip={skip}")
+
+          with open("skip.txt", "w", encoding="utf-8") as f:
+              f.write("true" if skip else "false")
           PY
 
           echo "skip=$(cat skip.txt)" >> "$GITHUB_OUTPUT"
