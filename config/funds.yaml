@@ -1,5 +1,5 @@
 app:
-  xlsx_path: data/test.xlsx
+  xlsx_path: data/buy.xlsx
   threshold: 0.8
   ntfy_url: ntfy.sh/jijin_562877716
 funds:

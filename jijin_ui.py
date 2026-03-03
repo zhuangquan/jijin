@@ -724,6 +724,7 @@ class JijinUI(tk.Tk):
 
         self.tx_menu = tk.Menu(self, tearoff=0)
         self.tx_menu.add_command(label="\u4fee\u6539", command=self.edit_selected_record)
+        self.tx_menu.add_command(label="\u5356\u51fa", command=self.sell_selected_records)
 
         summary_box = ttk.LabelFrame(frame, text="\u5f53\u524d\u57fa\u91d1\u6c47\u603b", padding=2, style="Summary.TLabelframe")
         summary_box.grid(row=2, column=0, sticky="ew", pady=(4, 0))
@@ -1556,13 +1557,17 @@ class JijinUI(tk.Tk):
         self._save_trade_doc()
         self.refresh_fund_view()
 
-    def delete_selected_records(self) -> None:
+    def _remove_selected_records(self, action_text: str) -> None:
         selected = self.tx_tree.selection()
         if not selected:
-            messagebox.showwarning("\u63d0\u793a", "\u8bf7\u5148\u9009\u62e9\u8981\u5220\u9664\u7684\u8bb0\u5f55")
+            messagebox.showwarning("\u63d0\u793a", f"\u8bf7\u5148\u9009\u62e9\u8981{action_text}\u7684\u8bb0\u5f55")
             return
 
-        if not messagebox.askyesno("\u786e\u8ba4", f"\u786e\u5b9a\u5220\u9664\u9009\u4e2d\u7684 {len(selected)} \u6761\u8bb0\u5f55\u5417\uff1f"):
+        if action_text == "\u5356\u51fa":
+            confirm_text = f"\u786e\u5b9a\u5356\u51fa\u9009\u4e2d\u7684 {len(selected)} \u6761\u8bb0\u5f55\u5417\uff1f\n\uff08\u5356\u51fa\u7b49\u540c\u4e8e\u5220\u9664\u8be5\u6761\u4e70\u5165\u8bb0\u5f55\uff09"
+        else:
+            confirm_text = f"\u786e\u5b9a\u5220\u9664\u9009\u4e2d\u7684 {len(selected)} \u6761\u8bb0\u5f55\u5417\uff1f"
+        if not messagebox.askyesno("\u786e\u8ba4", confirm_text):
             return
 
         to_delete = {int(iid) for iid in selected}
@@ -1570,6 +1575,12 @@ class JijinUI(tk.Tk):
         self._persist_fund_changes()
         self.refresh_fund_list(keep_current=True)
         self.refresh_fund_view()
+
+    def sell_selected_records(self) -> None:
+        self._remove_selected_records("\u5356\u51fa")
+
+    def delete_selected_records(self) -> None:
+        self._remove_selected_records("\u5220\u9664")
 
 
 def main() -> None:
