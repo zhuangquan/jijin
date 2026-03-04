@@ -339,68 +339,11 @@ def write_output(input_path: Path, output_path: Path, summaries: Dict[str, Dict]
     ensure_transactions_workbook(input_path)
     wb = openpyxl.load_workbook(input_path)
 
+    # Keep workbook focused on transaction sheets only.
+    _ = summaries
     for name in ("summary", "positions", "汇总", "持仓明细"):
         if name in wb.sheetnames:
             wb.remove(wb[name])
-
-    summary_ws = wb.create_sheet("汇总")
-    summary_ws.append(
-        [
-            "基金代码",
-            "净值日期",
-            "最新净值",
-            "持仓份额",
-            "总成本",
-            "市值",
-            "盈利金额",
-            "盈利比例",
-            "超卖份额",
-        ]
-    )
-
-    positions_ws = wb.create_sheet("持仓明细")
-    positions_ws.append(
-        [
-            "基金代码",
-            "买入日期",
-            "买入净值",
-            "剩余份额",
-            "成本",
-            "最新净值",
-            "盈利金额",
-            "盈利比例",
-        ]
-    )
-
-    for code in sorted(summaries.keys()):
-        s = summaries[code]
-        summary_ws.append(
-            [
-                code,
-                s["nav_date"],
-                s["latest_nav"],
-                s["holding_shares"],
-                s["total_cost"],
-                s["market_value"],
-                s["profit_amount"],
-                s["profit_rate"],
-                s["oversold"],
-            ]
-        )
-
-        for lot in s["lots"]:
-            positions_ws.append(
-                [
-                    code,
-                    lot["buy_date"],
-                    lot["buy_nav"],
-                    lot["remaining_shares"],
-                    lot["cost"],
-                    lot["latest_nav"],
-                    lot["profit_amount"],
-                    lot["profit_rate"],
-                ]
-            )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)

@@ -3,6 +3,7 @@ app:
   threshold: 0.8
   ntfy_url: ntfy.sh/jijin_562877716
 funds:
+- '002001'
 - 005827
 - '161005'
 - '163417'
