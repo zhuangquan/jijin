@@ -16,7 +16,7 @@ import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import yaml
 
-from jingzhi import DualTriggerParams, DualTriggerState, decide, stock_basket_index_equal_weights
+from strategy import DualTriggerParams, DualTriggerState, decide, stock_basket_index_equal_weights
 
 
 EASTMONEY_LSJZ_URL = "https://api.fund.eastmoney.com/f10/lsjz"
@@ -40,6 +40,8 @@ DECISION_FREQ_LABEL_TO_VALUE = {
     "每季度": "quarterly",
 }
 DECISION_FREQ_VALUE_TO_LABEL = {v: k for k, v in DECISION_FREQ_LABEL_TO_VALUE.items()}
+STRATEGY_PEAK_CONFIG_FILE = "strategy_peak.yaml"
+STRATEGY_FIXED_NEW_HIGH_EPS = 1e-10
 
 DEFAULT_CONFIG = {
     "app": {
@@ -636,6 +638,11 @@ class JijinUI(tk.Tk):
         self.strategy_cash_value_var = tk.StringVar(value="0")
         self.strategy_stock_values_var = tk.StringVar(value="")
         self.strategy_param_vars: Dict[str, tk.Variable] = {}
+        self.strategy_weights_preview_var = tk.StringVar(value="未配置（默认等权）")
+        self.strategy_dd_gap_preview_var = tk.StringVar(value="未配置")
+        self.strategy_reset_year_var = tk.StringVar(value="")
+        self.strategy_reset_month_var = tk.StringVar(value="")
+        self.strategy_reset_day_var = tk.StringVar(value="")
         self.strategy_params_text: Optional[tk.Text] = None
         self.strategy_state_text: Optional[tk.Text] = None
         self.strategy_output_cn_text: Optional[tk.Text] = None
@@ -1032,20 +1039,16 @@ class JijinUI(tk.Tk):
 
         btns = ttk.Frame(base_box, style="Card.TFrame")
         btns.grid(row=2, column=0, columnspan=6, sticky="ew", pady=(8, 0))
+        btns.columnconfigure(1, weight=1)
         self.strategy_run_btn = ttk.Button(btns, text="\u6267\u884c\u51b3\u7b56", command=self._run_strategy_decision, style="ToolbarPrimary.TButton")
         self.strategy_run_btn.grid(row=0, column=0, sticky="w")
-        ttk.Label(btns, textvariable=self.strategy_status_var, style="Subtle.TLabel").grid(row=0, column=1, padx=(10, 0), sticky="w")
+        ttk.Entry(btns, textvariable=self.strategy_status_var, state="readonly").grid(row=0, column=1, padx=(10, 0), sticky="ew")
 
         params_box = ttk.LabelFrame(frame, text="策略参数（表单）", padding=6, style="Summary.TLabelframe")
         params_box.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
         params_box.columnconfigure(0, weight=1)
         params_box.rowconfigure(0, weight=1)
         self._build_strategy_params_form(params_box)
-        ttk.Label(
-            params_box,
-            text="计算完成后会弹窗显示参数、状态和执行结果的中文解读。",
-            style="Subtle.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
         self._strategy_reset_defaults(force=True)
         self._strategy_fill_from_portfolio()
@@ -1083,6 +1086,287 @@ class JijinUI(tk.Tk):
         ttk.Entry(frame, textvariable=var, width=width).grid(row=row, column=1, columnspan=2, sticky="ew", padx=(6, 0), pady=(3, 0))
 
     @staticmethod
+    def _strategy_format_percent_num(value: float) -> str:
+        return f"{float(value):.6f}".rstrip("0").rstrip(".")
+
+    def _strategy_refresh_weights_preview(self) -> None:
+        if self.strategy_weights_preview_var is None:
+            return
+        raw = ""
+        var = self.strategy_param_vars.get("target_stock_fund_weights")
+        if var is not None:
+            raw = str(var.get() or "").strip()
+        if not raw:
+            self.strategy_weights_preview_var.set("未配置（默认等权）")
+            return
+
+        parsed = self._strategy_parse_code_float_map(raw)
+        if not parsed:
+            self.strategy_weights_preview_var.set("未配置（默认等权）")
+            return
+
+        parts: List[str] = []
+        for code, val in sorted(parsed.items()):
+            pct = float(val) * 100.0 if float(val) <= 1.0 else float(val)
+            name = str(self.fund_name_cache.get(code, "") or "").strip()
+            title = f"{name}({code})" if name else code
+            parts.append(f"{title} {self._strategy_format_percent_num(pct)}%")
+        self.strategy_weights_preview_var.set("；".join(parts))
+
+    def _strategy_open_weights_dialog(self) -> None:
+        funds = self.get_all_fund_codes()
+        if not funds:
+            messagebox.showwarning("提示", "当前“股票基金”暂无可配置的基金")
+            return
+
+        existing_raw = ""
+        var = self.strategy_param_vars.get("target_stock_fund_weights")
+        if var is not None:
+            existing_raw = str(var.get() or "").strip()
+        existing_map = self._strategy_parse_code_float_map(existing_raw) if existing_raw else {}
+        existing_pct_map: Dict[str, float] = {}
+        for code, val in existing_map.items():
+            existing_pct_map[code] = float(val) * 100.0 if float(val) <= 1.0 else float(val)
+
+        dialog = tk.Toplevel(self)
+        dialog.title("配置股票子基权重")
+        dialog.geometry("680x560")
+        dialog.minsize(620, 420)
+        dialog.transient(self)
+
+        root = ttk.Frame(dialog, style="App.TFrame", padding=8)
+        root.pack(fill=tk.BOTH, expand=True)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(1, weight=1)
+
+        ttk.Label(root, text="请按百分比填写各基金权重，保存时合计必须为 100%", style="Subtle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        table = ttk.Frame(root, style="Card.TFrame")
+        table.grid(row=1, column=0, sticky="nsew")
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(table, highlightthickness=0, bg=self.colors["surface"])
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(table, orient=tk.VERTICAL, command=canvas.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scroll.set)
+
+        body = ttk.Frame(canvas, style="Card.TFrame")
+        body_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _on_body_configure(_e) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(e) -> None:
+            canvas.itemconfigure(body_id, width=e.width)
+
+        body.bind("<Configure>", _on_body_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        ttk.Label(body, text="基金", style="SummaryHead.TLabel").grid(row=0, column=0, sticky="w", padx=(4, 0))
+        ttk.Label(body, text="权重(%)", style="SummaryHead.TLabel").grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        entry_vars: Dict[str, tk.StringVar] = {}
+        for idx, code in enumerate(funds, start=1):
+            name = str(self.fund_name_cache.get(code, "") or "").strip()
+            title = f"{name}({code})" if name else code
+            ttk.Label(body, text=title, style="Body.TLabel").grid(row=idx, column=0, sticky="w", padx=(4, 0), pady=(4, 0))
+            value = existing_pct_map.get(code)
+            var_pct = tk.StringVar(value="" if value is None else self._strategy_format_percent_num(value))
+            entry_vars[code] = var_pct
+            ttk.Entry(body, textvariable=var_pct, width=12).grid(row=idx, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+
+        def fill_equal() -> None:
+            if not funds:
+                return
+            each = 100.0 / float(len(funds))
+            vals = [round(each, 6) for _ in funds]
+            vals[-1] = round(100.0 - sum(vals[:-1]), 6)
+            for code, v in zip(funds, vals):
+                entry_vars[code].set(self._strategy_format_percent_num(v))
+
+        def clear_default() -> None:
+            tgt_var = self.strategy_param_vars.get("target_stock_fund_weights")
+            if tgt_var is not None:
+                tgt_var.set("")
+            self._strategy_refresh_weights_preview()
+            self.strategy_status_var.set("已清空股票子基权重，后续按默认等权执行")
+            dialog.destroy()
+
+        def save_weights() -> None:
+            weights_pct: Dict[str, float] = {}
+            total = 0.0
+            for code in funds:
+                raw_text = str(entry_vars[code].get() or "").strip()
+                if not raw_text:
+                    continue
+                num = to_float(raw_text, default=None)
+                if num is None:
+                    messagebox.showwarning("提示", f"{code} 的权重不是数字")
+                    return
+                val = float(num)
+                if val < 0:
+                    messagebox.showwarning("提示", f"{code} 的权重不能为负数")
+                    return
+                if val > 0:
+                    weights_pct[code] = val
+                    total += val
+
+            if abs(total - 100.0) > 1e-6:
+                messagebox.showwarning("提示", f"权重合计必须为 100%，当前为 {self._strategy_format_percent_num(total)}%")
+                return
+
+            tgt_var = self.strategy_param_vars.get("target_stock_fund_weights")
+            if tgt_var is not None:
+                tgt_var.set(json.dumps(weights_pct, ensure_ascii=False))
+            self._strategy_refresh_weights_preview()
+            self.strategy_status_var.set("已更新股票子基权重（合计100%）")
+            dialog.destroy()
+
+        btns = ttk.Frame(root, style="App.TFrame")
+        btns.grid(row=2, column=0, sticky="e", pady=(8, 0))
+        ttk.Button(btns, text="均分", command=fill_equal, style="Toolbar.TButton").grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(btns, text="默认等权", command=clear_default, style="Toolbar.TButton").grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(btns, text="保存", command=save_weights, style="ToolbarPrimary.TButton").grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(btns, text="取消", command=dialog.destroy, style="Toolbar.TButton").grid(row=0, column=3)
+
+        self._center_dialog(dialog)
+        dialog.wait_window()
+
+    def _strategy_refresh_dd_gap_preview(self) -> None:
+        if self.strategy_dd_gap_preview_var is None:
+            return
+        dd_var = self.strategy_param_vars.get("dd_stages")
+        gap_var = self.strategy_param_vars.get("gap_fill")
+        if dd_var is None or gap_var is None:
+            self.strategy_dd_gap_preview_var.set("未配置")
+            return
+
+        dd_raw = str(dd_var.get() or "").strip()
+        gap_raw = str(gap_var.get() or "").strip()
+        if not dd_raw or not gap_raw:
+            self.strategy_dd_gap_preview_var.set("未配置")
+            return
+        try:
+            dd_vals = self._strategy_parse_percent_list(dd_raw, "回撤触发档位")
+            gap_vals = self._strategy_parse_percent_list(gap_raw, "每档补差额比例")
+        except Exception:
+            self.strategy_dd_gap_preview_var.set("未配置")
+            return
+        if len(dd_vals) != 3 or len(gap_vals) != 3:
+            self.strategy_dd_gap_preview_var.set("未配置（需3档）")
+            return
+
+        parts: List[str] = []
+        for dd, gp in zip(dd_vals, gap_vals):
+            dd_pct = self._strategy_format_percent_num(float(dd) * 100.0)
+            gp_pct = self._strategy_format_percent_num(float(gp) * 100.0)
+            parts.append(f"回撤{dd_pct}%→补差额{gp_pct}%")
+        self.strategy_dd_gap_preview_var.set("；".join(parts))
+
+    def _strategy_open_dd_gap_dialog(self) -> None:
+        dd_var = self.strategy_param_vars.get("dd_stages")
+        gap_var = self.strategy_param_vars.get("gap_fill")
+        if dd_var is None or gap_var is None:
+            return
+
+        def _parse_pct_list_or_default(raw_text: str, defaults: List[float], field_name: str) -> List[float]:
+            text = str(raw_text or "").strip()
+            if not text:
+                return list(defaults)
+            try:
+                vals = self._strategy_parse_percent_list(text, field_name)
+                if len(vals) != 3:
+                    return list(defaults)
+                return [float(x) * 100.0 for x in vals]
+            except Exception:
+                return list(defaults)
+
+        dd_defaults = [20.0, 30.0, 40.0]
+        gap_defaults = [40.0, 70.0, 100.0]
+        dd_init = _parse_pct_list_or_default(str(dd_var.get()), dd_defaults, "回撤触发档位")
+        gap_init = _parse_pct_list_or_default(str(gap_var.get()), gap_defaults, "每档补差额比例")
+
+        dialog = tk.Toplevel(self)
+        dialog.title("配置回撤与补差额")
+        dialog.geometry("520x300")
+        dialog.minsize(460, 260)
+        dialog.transient(self)
+
+        root = ttk.Frame(dialog, style="App.TFrame", padding=10)
+        root.pack(fill=tk.BOTH, expand=True)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(1, weight=1)
+
+        ttk.Label(root, text="请填写3档回撤触发与补差额，单位均为百分比", style="Subtle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        table = ttk.Frame(root, style="Card.TFrame")
+        table.grid(row=1, column=0, sticky="nsew")
+        for c in range(6):
+            table.columnconfigure(c, weight=0)
+
+        dd_entries: List[tk.StringVar] = []
+        gap_entries: List[tk.StringVar] = []
+        for i in range(3):
+            dd_text = self._strategy_format_percent_num(dd_init[i])
+            gap_text = self._strategy_format_percent_num(gap_init[i])
+            v_dd = tk.StringVar(value=dd_text)
+            v_gp = tk.StringVar(value=gap_text)
+            dd_entries.append(v_dd)
+            gap_entries.append(v_gp)
+
+            ttk.Label(table, text=f"提示回撤{i + 1}", style="Body.TLabel").grid(row=i, column=0, sticky="w", padx=(8, 4), pady=(8 if i == 0 else 6, 0))
+            ttk.Entry(table, textvariable=v_dd, width=10).grid(row=i, column=1, sticky="w", pady=(8 if i == 0 else 6, 0))
+            ttk.Label(table, text="%", style="Subtle.TLabel").grid(row=i, column=2, sticky="w", padx=(4, 12), pady=(8 if i == 0 else 6, 0))
+            ttk.Label(table, text="补差额", style="Body.TLabel").grid(row=i, column=3, sticky="w", pady=(8 if i == 0 else 6, 0))
+            ttk.Entry(table, textvariable=v_gp, width=10).grid(row=i, column=4, sticky="w", pady=(8 if i == 0 else 6, 0))
+            ttk.Label(table, text="%", style="Subtle.TLabel").grid(row=i, column=5, sticky="w", padx=(4, 0), pady=(8 if i == 0 else 6, 0))
+
+        def save_pair_config() -> None:
+            dd_pct: List[float] = []
+            gap_pct: List[float] = []
+
+            for idx in range(3):
+                dd_raw = str(dd_entries[idx].get() or "").strip()
+                gp_raw = str(gap_entries[idx].get() or "").strip()
+                if not dd_raw or not gp_raw:
+                    messagebox.showwarning("提示", f"第{idx + 1}档请完整填写")
+                    return
+                dd_num = to_float(dd_raw, default=None)
+                gp_num = to_float(gp_raw, default=None)
+                if dd_num is None or gp_num is None:
+                    messagebox.showwarning("提示", f"第{idx + 1}档必须填写数字")
+                    return
+                dd_val = float(dd_num)
+                gp_val = float(gp_num)
+                if dd_val < 0 or gp_val < 0:
+                    messagebox.showwarning("提示", f"第{idx + 1}档不能为负数")
+                    return
+                if dd_val > 100 or gp_val > 100:
+                    messagebox.showwarning("提示", f"第{idx + 1}档不能大于100%")
+                    return
+                dd_pct.append(dd_val)
+                gap_pct.append(gp_val)
+
+            if not (dd_pct[0] < dd_pct[1] < dd_pct[2]):
+                messagebox.showwarning("提示", "3档回撤触发值需要从小到大递增")
+                return
+
+            dd_var.set(",".join(f"{self._strategy_format_percent_num(x)}%" for x in dd_pct))
+            gap_var.set(",".join(f"{self._strategy_format_percent_num(x)}%" for x in gap_pct))
+            self._strategy_refresh_dd_gap_preview()
+            self.strategy_status_var.set("已更新回撤触发与补差额（3档）")
+            dialog.destroy()
+
+        btns = ttk.Frame(root, style="App.TFrame")
+        btns.grid(row=2, column=0, sticky="e", pady=(10, 0))
+        ttk.Button(btns, text="确定", command=save_pair_config, style="ToolbarPrimary.TButton").grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(btns, text="取消", command=dialog.destroy, style="Toolbar.TButton").grid(row=0, column=1)
+
+        self._center_dialog(dialog)
+        dialog.wait_window()
+
+    @staticmethod
     def _strategy_parse_percent_to_ratio(raw_value, field_name: str) -> float:
         text = str(raw_value or "").strip()
         has_pct = text.endswith("%")
@@ -1115,6 +1399,66 @@ class JijinUI(tk.Tk):
         pct = float(num) * 100.0
         return f"{pct:.6f}".rstrip("0").rstrip(".")
 
+    @staticmethod
+    def _strategy_parse_zh_date_to_iso(raw_value: object, field_name: str) -> Optional[str]:
+        text = str(raw_value or "").strip()
+        if (not text) or (text == "____年__月__日"):
+            return None
+        m = re.fullmatch(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", text)
+        if m:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            try:
+                return dt.date(y, mo, d).isoformat()
+            except ValueError:
+                raise ValueError(f"{field_name}不是有效日期")
+        parsed = parse_date(text)
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", parsed):
+            return parsed
+        raise ValueError(f"{field_name}格式应为 YYYY年MM月DD日")
+
+    @staticmethod
+    def _strategy_iso_date_to_zh_text(raw_value: object) -> str:
+        parsed = parse_date(raw_value)
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", parsed):
+            return ""
+        return f"{parsed[0:4]}年{parsed[5:7]}月{parsed[8:10]}日"
+
+    def _strategy_collect_reset_date_iso(self) -> Optional[str]:
+        y = str(self.strategy_reset_year_var.get() or "").strip()
+        m = str(self.strategy_reset_month_var.get() or "").strip()
+        d = str(self.strategy_reset_day_var.get() or "").strip()
+        if not y and not m and not d:
+            return None
+        if not y or not m or not d:
+            raise ValueError("仓位转化日期请完整填写 年/月/日")
+        if (not y.isdigit()) or (not m.isdigit()) or (not d.isdigit()):
+            raise ValueError("仓位转化日期必须是数字")
+        try:
+            return dt.date(int(y), int(m), int(d)).isoformat()
+        except ValueError:
+            raise ValueError("仓位转化日期不是有效日期")
+
+    def _strategy_set_reset_date_from_value(self, raw_value: object) -> None:
+        iso = ""
+        parsed = parse_date(raw_value)
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", parsed):
+            iso = parsed
+        else:
+            try:
+                alt = self._strategy_parse_zh_date_to_iso(raw_value, "仓位转化日期")
+                if alt and re.fullmatch(r"\d{4}-\d{2}-\d{2}", alt):
+                    iso = alt
+            except Exception:
+                iso = ""
+        if iso:
+            self.strategy_reset_year_var.set(iso[0:4])
+            self.strategy_reset_month_var.set(str(int(iso[5:7])))
+            self.strategy_reset_day_var.set(str(int(iso[8:10])))
+        else:
+            self.strategy_reset_year_var.set("")
+            self.strategy_reset_month_var.set("")
+            self.strategy_reset_day_var.set("")
+
     def _strategy_parse_percent_list(self, raw: str, field_name: str) -> List[float]:
         vals: List[float] = []
         for seg in re.split(r"[,;，；\s]+", str(raw or "").strip()):
@@ -1131,7 +1475,7 @@ class JijinUI(tk.Tk):
         form.columnconfigure(0, weight=1)
         form.columnconfigure(1, weight=1)
 
-        left = ttk.LabelFrame(form, text="\u4ed3\u4f4d/\u89e6\u53d1", style="Summary.TLabelframe", padding=6)
+        left = ttk.LabelFrame(form, text="\u80a1\u7968\u4ed3\u4f4d/\u89e6\u53d1", style="Summary.TLabelframe", padding=6)
         right = ttk.LabelFrame(form, text="\u9ad8\u7ea7/\u7ea6\u675f", style="Summary.TLabelframe", padding=6)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
         right.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
@@ -1143,27 +1487,40 @@ class JijinUI(tk.Tk):
         self._strategy_add_ratio_field(left, 1, "\u4ed3\u4f4d\u4e0b\u9650", "force_low_w", "20")
         self._strategy_add_ratio_field(left, 2, "\u4ed3\u4f4d\u4e0a\u9650", "force_high_w", "40")
         self._strategy_add_ratio_field(left, 3, "\u9ad8\u4ed3\u56de\u843d\u76ee\u6807", "force_high_target_w", "35")
-        self._strategy_add_entry_field(left, 4, "\u56de\u64a4\u89e6\u53d1\u6863(%\uff0c\u7528\u9017\u53f7\u9694\u5f00)", "dd_stages", "20%,30%,40%")
-        self._strategy_add_entry_field(left, 5, "\u6bcf\u6863\u8865\u4ed3\u6bd4\u4f8b(%\uff0c\u7528\u9017\u53f7\u9694\u5f00)", "gap_fill", "40%,70%,100%")
+        self._strategy_get_var("dd_stages", "20%,30%,40%", kind="str")
+        self._strategy_get_var("gap_fill", "40%,70%,100%", kind="str")
+        ttk.Label(left, text="回撤触发与每档补差额", style="Body.TLabel").grid(row=4, column=0, sticky="w", pady=(3, 0))
+        ttk.Button(left, text="配置", command=self._strategy_open_dd_gap_dialog, style="Toolbar.TButton").grid(
+            row=4, column=1, columnspan=2, sticky="w", padx=(6, 0), pady=(3, 0)
+        )
+        self._strategy_refresh_dd_gap_preview()
 
         freq_var = self._strategy_get_var("decision_freq", DECISION_FREQ_VALUE_TO_LABEL.get("weekly", "每周"), kind="str")
-        ttk.Label(left, text="\u51b3\u7b56\u9891\u7387", style="Body.TLabel").grid(row=6, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(left, text="\u51b3\u7b56\u9891\u7387", style="Body.TLabel").grid(row=5, column=0, sticky="w", pady=(3, 0))
         ttk.Combobox(left, textvariable=freq_var, values=tuple(DECISION_FREQ_LABEL_TO_VALUE.keys()), state="readonly", width=16).grid(
-            row=6, column=1, columnspan=2, sticky="w", padx=(6, 0), pady=(3, 0)
+            row=5, column=1, columnspan=2, sticky="w", padx=(6, 0), pady=(3, 0)
         )
 
         self._strategy_add_entry_field(right, 0, "\u56de\u64a4\u6eda\u52a8\u7a97\u53e3(\u7a7a=\u5168\u90e8)", "peak_rolling_days", "252")
         self._strategy_add_entry_field(right, 1, "\u4ed3\u4f4d\u8fc7\u4f4e\u51b7\u9759\u671f(\u5929)", "force_low_cooldown_days", "60")
         self._strategy_add_entry_field(right, 2, "\u503a\u57fa\u6700\u4f4e\u4fdd\u7559", "min_bond_value", "0")
         self._strategy_add_entry_field(right, 3, "\u80a1\u7968\u6700\u4f4e\u4fdd\u7559", "min_stock_total_value", "0")
-        self._strategy_add_entry_field(right, 4, "\u65b0\u9ad8\u91cd\u7f6e\u5bb9\u5dee", "new_high_epsilon", "1e-10")
-        self._strategy_add_entry_field(
-            right,
-            5,
-            "\u80a1\u7968\u5b50\u57fa\u6743\u91cd(\u53ef\u7a7a,\u5355\u4f4d%\uff09\n\u4f8b\u5982: 000001:50,000002:50",
-            "target_stock_fund_weights",
-            "",
+        self._strategy_get_var("last_stage_reset_date", "", kind="str")
+        ttk.Label(right, text="仓位转化日期", style="Body.TLabel").grid(row=4, column=0, sticky="w", pady=(3, 0))
+        date_row = ttk.Frame(right, style="App.TFrame")
+        date_row.grid(row=4, column=1, columnspan=2, sticky="w", padx=(6, 0), pady=(3, 0))
+        ttk.Entry(date_row, textvariable=self.strategy_reset_year_var, width=4).grid(row=0, column=0, sticky="w")
+        ttk.Label(date_row, text="年", style="Body.TLabel").grid(row=0, column=1, sticky="w", padx=(2, 6))
+        ttk.Entry(date_row, textvariable=self.strategy_reset_month_var, width=2).grid(row=0, column=2, sticky="w")
+        ttk.Label(date_row, text="月", style="Body.TLabel").grid(row=0, column=3, sticky="w", padx=(2, 6))
+        ttk.Entry(date_row, textvariable=self.strategy_reset_day_var, width=2).grid(row=0, column=4, sticky="w")
+        ttk.Label(date_row, text="日", style="Body.TLabel").grid(row=0, column=5, sticky="w", padx=(2, 0))
+        self._strategy_get_var("target_stock_fund_weights", "", kind="str")
+        ttk.Label(right, text="股票子基权重", style="Body.TLabel").grid(row=5, column=0, sticky="w", pady=(3, 0))
+        ttk.Button(right, text="配置", command=self._strategy_open_weights_dialog, style="Toolbar.TButton").grid(
+            row=5, column=1, columnspan=2, sticky="w", padx=(6, 0), pady=(3, 0)
         )
+        self._strategy_refresh_weights_preview()
 
     @staticmethod
     def _strategy_parse_num_list(raw: str) -> List[float]:
@@ -1193,11 +1550,11 @@ class JijinUI(tk.Tk):
             return float(n)
 
         dd_stages = self._strategy_parse_percent_list(str(self.strategy_param_vars["dd_stages"].get()), "回撤触发档位")
-        gap_fill = self._strategy_parse_percent_list(str(self.strategy_param_vars["gap_fill"].get()), "每档补仓比例")
+        gap_fill = self._strategy_parse_percent_list(str(self.strategy_param_vars["gap_fill"].get()), "每档补差额比例")
         if len(dd_stages) != 3:
             raise ValueError("回撤触发档位需要 3 个数值，例如 20,30,40")
         if len(gap_fill) != 3:
-            raise ValueError("每档补仓比例需要 3 个数值，例如 40,70,100")
+            raise ValueError("每档补差额比例需要 3 个数值，例如 40,70,100")
 
         peak_text = str(self.strategy_param_vars["peak_rolling_days"].get()).strip()
         cooldown_text = str(self.strategy_param_vars["force_low_cooldown_days"].get()).strip()
@@ -1218,6 +1575,8 @@ class JijinUI(tk.Tk):
         cooldown_value = int(to_float(cooldown_text, default=60) or 60)
         if cooldown_value < 0:
             raise ValueError("低仓冷静期天数不能为负数")
+        reset_date_value = self._strategy_collect_reset_date_iso()
+        self.strategy_param_vars["last_stage_reset_date"].set(reset_date_value or "")
 
         target_stock_w = self._strategy_parse_percent_to_ratio(self.strategy_param_vars["target_stock_w"].get(), "目标股票仓位")
         force_low_w = self._strategy_parse_percent_to_ratio(self.strategy_param_vars["force_low_w"].get(), "仓位下限")
@@ -1250,8 +1609,8 @@ class JijinUI(tk.Tk):
             "decision_freq": freq,
             "min_bond_value": num("min_bond_value", default=0.0),
             "min_stock_total_value": num("min_stock_total_value", default=0.0),
+            "last_stage_reset_date": reset_date_value,
             "target_stock_fund_weights": weights if weights else None,
-            "new_high_epsilon": num("new_high_epsilon", default=1e-10),
         }
 
     def _strategy_apply_params_to_form(self, params_dict: Dict) -> None:
@@ -1266,7 +1625,7 @@ class JijinUI(tk.Tk):
                 except Exception:
                     pass
 
-        num_keys = ["min_bond_value", "min_stock_total_value", "new_high_epsilon"]
+        num_keys = ["min_bond_value", "min_stock_total_value"]
         for key in num_keys:
             if key in params_dict and params_dict[key] not in ("", None):
                 try:
@@ -1286,12 +1645,21 @@ class JijinUI(tk.Tk):
         if "decision_freq" in params_dict and params_dict["decision_freq"]:
             raw_freq = str(params_dict["decision_freq"])
             self.strategy_param_vars["decision_freq"].set(DECISION_FREQ_VALUE_TO_LABEL.get(raw_freq, raw_freq))
+        if "last_stage_reset_date" in params_dict:
+            reset_iso = parse_date(params_dict.get("last_stage_reset_date"))
+            self.strategy_param_vars["last_stage_reset_date"].set(reset_iso if re.fullmatch(r"\d{4}-\d{2}-\d{2}", reset_iso) else "")
+            self._strategy_set_reset_date_from_value(params_dict.get("last_stage_reset_date"))
+        else:
+            self.strategy_param_vars["last_stage_reset_date"].set("")
+            self._strategy_set_reset_date_from_value(None)
         if "target_stock_fund_weights" in params_dict:
             weights = params_dict["target_stock_fund_weights"]
             if isinstance(weights, dict) and weights:
                 self.strategy_param_vars["target_stock_fund_weights"].set(json.dumps(weights, ensure_ascii=False))
             else:
                 self.strategy_param_vars["target_stock_fund_weights"].set("")
+        self._strategy_refresh_dd_gap_preview()
+        self._strategy_refresh_weights_preview()
 
     def _strategy_sync_params_text_from_form(self) -> None:
         try:
@@ -1351,6 +1719,7 @@ class JijinUI(tk.Tk):
             "decision_freq": "weekly",
             "min_bond_value": 0.0,
             "min_stock_total_value": 0.0,
+            "last_stage_reset_date": None,
             "target_stock_fund_weights": None,
             "new_high_epsilon": 1e-10,
         }
@@ -1375,6 +1744,9 @@ class JijinUI(tk.Tk):
                 "dd_triggered": [],
                 "cooldown_until_date": None,
                 "last_decision_date": None,
+                "pending_reset_date": None,
+                "last_stage_wait_conversion": False,
+                "use_trade_peak_for_dd": False,
             }
             self.strategy_state_json_cache = json.dumps(state_dict, ensure_ascii=False, indent=2)
             self._strategy_text_set(self.strategy_state_text, self.strategy_state_json_cache)
@@ -1387,7 +1759,14 @@ class JijinUI(tk.Tk):
                     raise ValueError("state JSON \u5fc5\u987b\u662f\u5bf9\u8c61")
             except Exception:
                 self.strategy_state_json_cache = json.dumps(
-                    {"dd_triggered": [], "cooldown_until_date": None, "last_decision_date": None},
+                    {
+                        "dd_triggered": [],
+                        "cooldown_until_date": None,
+                        "last_decision_date": None,
+                        "pending_reset_date": None,
+                        "last_stage_wait_conversion": False,
+                        "use_trade_peak_for_dd": False,
+                    },
                     ensure_ascii=False,
                     indent=2,
                 )
@@ -1469,6 +1848,175 @@ class JijinUI(tk.Tk):
         self.strategy_stock_values_var.set(json.dumps(stock_values, ensure_ascii=False))
         self.strategy_status_var.set(f"\u5df2\u6309\u5f53\u524d\u6301\u4ed3\u586b\u5145\u7b56\u7565\u8f93\u5165\uff08\u503a\u57fa={bond_market:.2f}\uff09")
 
+    def _strategy_peak_config_path(self) -> Path:
+        base_dir = self.config_path.parent if self.config_path else Path("config")
+        return base_dir / STRATEGY_PEAK_CONFIG_FILE
+
+    def _strategy_load_peak_config(self) -> Dict:
+        path = self._strategy_peak_config_path()
+        if not path.exists():
+            return {}
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            if not isinstance(raw, dict):
+                return {}
+            peak_value = to_float(raw.get("peak_value"), default=None)
+            peak_date = parse_date(raw.get("peak_date"))
+            return {
+                "peak_value": float(peak_value) if peak_value is not None else None,
+                "peak_date": peak_date if peak_date else "",
+                "pending_reset_date": parse_date(raw.get("pending_reset_date")),
+                "reason": str(raw.get("reason", "") or ""),
+                "updated_at": str(raw.get("updated_at", "") or ""),
+            }
+        except Exception:
+            return {}
+
+    def _strategy_save_peak_config(self, data: Dict) -> None:
+        path = self._strategy_peak_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "peak_value": float(to_float(data.get("peak_value"), default=0.0) or 0.0),
+            "peak_date": str(data.get("peak_date", "") or ""),
+            "pending_reset_date": str(data.get("pending_reset_date", "") or ""),
+            "reason": str(data.get("reason", "") or ""),
+            "updated_at": str(data.get("updated_at", "") or ""),
+        }
+        path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    def _strategy_prepare_basket_with_peak_config(self, basket: pd.Series, today: pd.Timestamp) -> Tuple[pd.Series, Dict, str]:
+        cfg = self._strategy_load_peak_config()
+        source = "rolling_peak"
+        basket_used = basket
+        peak_date = str(cfg.get("peak_date", "") or "").strip()
+        if peak_date:
+            start_ts = pd.Timestamp(peak_date)
+            eligible = basket.index[basket.index >= start_ts]
+            if len(eligible) > 0 and eligible[0] <= today:
+                effective_ts = eligible[0]
+                basket_used = basket.loc[effective_ts:]
+                cfg["effective_peak_date"] = effective_ts.date().isoformat()
+                source = "peak_config"
+            else:
+                source = "peak_config_ignored"
+        return basket_used, cfg, source
+
+    def _strategy_update_peak_config(
+        self,
+        result: Dict,
+        basket_used: pd.Series,
+        today: pd.Timestamp,
+        params: DualTriggerParams,
+        cfg_before: Dict,
+        source: str,
+    ) -> Dict:
+        metrics = (result or {}).get("metrics") or {}
+        action = str((result or {}).get("action", "") or "")
+
+        window = basket_used.loc[:today]
+        if params.peak_rolling_days is not None:
+            window = window.tail(int(params.peak_rolling_days))
+
+        decision_peak_date = ""
+        decision_peak_value: Optional[float] = None
+        if not window.empty:
+            peak_idx = window.idxmax()
+            decision_peak_date = peak_idx.date().isoformat()
+            decision_peak_value = float(window.loc[peak_idx])
+
+        cfg_after = dict(cfg_before or {})
+        config_updated = False
+        update_reason = ""
+        new_state = (result or {}).get("new_state") or {}
+        pending_reset_date = str(new_state.get("pending_reset_date", "") or "").strip()
+        manual_reset_applied_date = str(metrics.get("manual_reset_applied_date", "") or "").strip()
+        manual_reset_applied_peak = to_float(metrics.get("manual_reset_applied_peak"), default=None)
+
+        if manual_reset_applied_date and manual_reset_applied_peak is not None:
+            cfg_after = {
+                "peak_value": float(manual_reset_applied_peak),
+                "peak_date": manual_reset_applied_date,
+                "pending_reset_date": "",
+                "reason": "manual_reset_applied",
+                "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+            }
+            self._strategy_save_peak_config(cfg_after)
+            config_updated = True
+            update_reason = f"按仓位转化日期 {self._strategy_iso_date_to_zh_text(manual_reset_applied_date) or manual_reset_applied_date} 完成峰值重置"
+
+        cfg_pending_before = str(cfg_after.get("pending_reset_date", "") or "").strip()
+        if (not config_updated) and (pending_reset_date != cfg_pending_before):
+            cfg_after = dict(cfg_after or {})
+            cfg_after["pending_reset_date"] = pending_reset_date
+            cfg_after["reason"] = "dd_last_stage_wait_manual_reset" if pending_reset_date else "pending_reset_cleared"
+            cfg_after["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
+            self._strategy_save_peak_config(cfg_after)
+            config_updated = True
+            if pending_reset_date:
+                update_reason = (
+                    "已记录仓位转化日期 "
+                    f"{self._strategy_iso_date_to_zh_text(pending_reset_date) or pending_reset_date}，到期后生效"
+                )
+            else:
+                update_reason = "已清空待执行仓位转化日期"
+
+        last_stage = max(list(params.dd_stages) or [0.0])
+        fired_stage = to_float(metrics.get("dd_stage_fired"), default=None)
+        is_last_stage_fire = action == "DD_ADD" and fired_stage is not None and abs(float(fired_stage) - float(last_stage)) <= 1e-12
+
+        if is_last_stage_fire and not config_updated:
+            if pending_reset_date:
+                cfg_after = dict(cfg_after or {})
+                cfg_after["pending_reset_date"] = pending_reset_date
+                cfg_after["reason"] = "dd_last_stage_wait_manual_reset"
+                cfg_after["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
+                self._strategy_save_peak_config(cfg_after)
+                config_updated = True
+                update_reason = (
+                    "已触发最后回撤档，已记录仓位转化日期 "
+                    f"{self._strategy_iso_date_to_zh_text(pending_reset_date) or pending_reset_date}，到期后生效"
+                )
+            else:
+                update_reason = "已触发最后回撤档，但未填写仓位转化日期，暂不重置峰值"
+
+        if not config_updated and not is_last_stage_fire:
+            old_peak = to_float(cfg_after.get("peak_value"), default=None)
+            old_date = str(cfg_after.get("peak_date", "") or "")
+            should_init = (not old_date) and (decision_peak_value is not None) and bool(decision_peak_date)
+            should_new_high = (
+                decision_peak_value is not None
+                and old_peak is not None
+                and decision_peak_value > old_peak + 1e-12
+                and bool(decision_peak_date)
+            )
+            if should_init or should_new_high:
+                cfg_after = {
+                    "peak_value": float(decision_peak_value or 0.0),
+                    "peak_date": decision_peak_date,
+                    "reason": "new_high_update" if should_new_high else "init_from_decision_peak",
+                    "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+                }
+                self._strategy_save_peak_config(cfg_after)
+                config_updated = True
+                update_reason = "检测到峰值更新，已写入配置文件"
+
+        effective_pending_reset = pending_reset_date or str(cfg_after.get("pending_reset_date", "") or "")
+        return {
+            "source": source,
+            "decision_peak_value": decision_peak_value,
+            "decision_peak_date": decision_peak_date,
+            "config_peak_value": to_float(cfg_after.get("peak_value"), default=None),
+            "config_peak_date": str(cfg_after.get("peak_date", "") or ""),
+            "config_pending_reset_date": str(cfg_after.get("pending_reset_date", "") or ""),
+            "config_reason": str(cfg_after.get("reason", "") or ""),
+            "config_updated_at": str(cfg_after.get("updated_at", "") or ""),
+            "config_updated": config_updated,
+            "update_reason": update_reason,
+            "pending_reset_date": effective_pending_reset,
+            "manual_reset_applied_date": manual_reset_applied_date,
+            "config_path": str(self._strategy_peak_config_path()),
+        }
+
     def _strategy_build_nav_df(self, funds: List[str], history_days: int, session: Optional[requests.Session] = None) -> pd.DataFrame:
         series_map: Dict[str, pd.Series] = {}
         errors: List[str] = []
@@ -1510,6 +2058,15 @@ class JijinUI(tk.Tk):
             data["peak_rolling_days"] = None
         if "target_stock_fund_weights" in data and data["target_stock_fund_weights"] in ("", None):
             data["target_stock_fund_weights"] = None
+        allowed_keys = set(getattr(DualTriggerParams, "__dataclass_fields__", {}).keys())
+        if "eps" in allowed_keys and "eps" not in data:
+            data["eps"] = STRATEGY_FIXED_NEW_HIGH_EPS
+        if "new_high_epsilon" in allowed_keys and "new_high_epsilon" not in data:
+            data["new_high_epsilon"] = STRATEGY_FIXED_NEW_HIGH_EPS
+        if "new_high_epsilon" in data and "eps" in allowed_keys and "eps" not in data:
+            data["eps"] = data.get("new_high_epsilon")
+        if allowed_keys:
+            data = {k: v for k, v in data.items() if k in allowed_keys}
         params = DualTriggerParams(**data)
         if params.target_stock_fund_weights is not None:
             mapped: Dict[str, float] = {}
@@ -1546,17 +2103,18 @@ class JijinUI(tk.Tk):
         else:
             lines.append("回撤触发档位：-")
         if gap_fill:
-            lines.append("每档补仓比例：" + " / ".join(self._strategy_fmt_pct(x) for x in gap_fill))
+            lines.append("每档补差额比例：" + " / ".join(self._strategy_fmt_pct(x) for x in gap_fill))
         else:
-            lines.append("每档补仓比例：-")
+            lines.append("每档补差额比例：-")
 
         lines.append(f"回撤滚动窗口：{p.get('peak_rolling_days', '-')}")
         lines.append(f"低仓冷静期天数：{p.get('force_low_cooldown_days', '-')}")
+        lines.append(f"仓位转化日期：{self._strategy_iso_date_to_zh_text(p.get('last_stage_reset_date')) or '-'}")
         freq_raw = str(p.get("decision_freq", "-"))
         lines.append(f"决策频率：{DECISION_FREQ_VALUE_TO_LABEL.get(freq_raw, freq_raw)}")
         lines.append(f"债基最低保留：{self._strategy_fmt_money(p.get('min_bond_value'))}")
         lines.append(f"股票最低保留：{self._strategy_fmt_money(p.get('min_stock_total_value'))}")
-        lines.append(f"新高重置容差：{p.get('new_high_epsilon', '-')}")
+        lines.append(f"新高重置容差：{p.get('new_high_epsilon', p.get('eps', '-'))}")
 
         weights = p.get("target_stock_fund_weights") or {}
         if isinstance(weights, dict) and weights:
@@ -1578,6 +2136,9 @@ class JijinUI(tk.Tk):
             lines.append("已触发回撤档位：无")
         lines.append(f"冷静期截止日：{s.get('cooldown_until_date') or '-'}")
         lines.append(f"上次决策日：{s.get('last_decision_date') or '-'}")
+        lines.append(f"待执行仓位转化日期：{self._strategy_iso_date_to_zh_text(s.get('pending_reset_date')) or '-'}")
+        lines.append(f"是否等待仓位转化：{'是' if bool(s.get('last_stage_wait_conversion')) else '否'}")
+        lines.append(f"回撤模式：{'trade_peak' if bool(s.get('use_trade_peak_for_dd')) else 'rolling_peak'}")
         return "\n".join(lines)
 
     def _show_strategy_result_dialog(self, params_cn: str, state_cn: str, output_cn: str) -> None:
@@ -1646,8 +2207,6 @@ class JijinUI(tk.Tk):
             return "未触发任何调仓条件"
         if text == "no trigger (cooldown)":
             return "冷静期内，未触发调仓"
-        if re.search(r"[A-Za-z]", text):
-            return "未命中已知规则，请检查参数和数据"
         return text
 
     def _strategy_error_zh(self, err: str) -> str:
@@ -1664,7 +2223,10 @@ class JijinUI(tk.Tk):
         }
         for src, dst in replacements.items():
             text = text.replace(src, dst)
-        return self._strategy_reason_zh(text)
+        reason_zh = self._strategy_reason_zh(text)
+        if reason_zh == "未命中已知规则，请检查参数和数据":
+            return f"系统异常（原始信息：{text}）"
+        return reason_zh
 
     @staticmethod
     def _strategy_action_zh(action: str) -> str:
@@ -1747,6 +2309,40 @@ class JijinUI(tk.Tk):
                 idx_today = to_float(metrics.get("stock_basket_index"), default=0.0) or 0.0
                 peak = to_float(metrics.get("peak"), default=0.0) or 0.0
                 lines.append(f"\u5f53\u524d\u7ec4\u5408\u6307\u6570\uff1a{idx_today:.6f} | \u7a97\u53e3\u5cf0\u503c\uff1a{peak:.6f}")
+        peak_meta = inputs.get("peak_meta") or {}
+        if peak_meta:
+            cfg_peak_val = to_float(peak_meta.get("config_peak_value"), default=None)
+            cfg_peak_date = str(peak_meta.get("config_peak_date", "") or "-")
+            decision_peak_val = to_float(peak_meta.get("decision_peak_value"), default=None)
+            decision_peak_date = str(peak_meta.get("decision_peak_date", "") or "-")
+            source = str(peak_meta.get("source", "") or "")
+            source_zh = {
+                "rolling_peak": "按滚动窗口峰值计算",
+                "peak_config": "使用峰值配置作为起点",
+                "peak_config_ignored": "峰值配置日期超出可用范围，已忽略",
+            }.get(source, source or "-")
+            lines.append("\u3010峰值基准信息\u3011")
+            if cfg_peak_val is not None:
+                lines.append(f"配置峰值：{cfg_peak_val:.6f}（根据 {cfg_peak_date} 净值更新）")
+            else:
+                lines.append("配置峰值：尚未写入")
+            if decision_peak_val is not None:
+                lines.append(f"本次决策峰值：{decision_peak_val:.6f}（根据 {decision_peak_date} 净值更新）")
+            lines.append(f"峰值来源：{source_zh}")
+            if peak_meta.get("config_updated"):
+                lines.append(f"峰值配置已更新：{peak_meta.get('update_reason', '-')}")
+            pending_reset_date = str(peak_meta.get("pending_reset_date", "") or "").strip()
+            if pending_reset_date:
+                lines.append(
+                    "待执行仓位转化日期："
+                    f"{self._strategy_iso_date_to_zh_text(pending_reset_date) or pending_reset_date}"
+                )
+            applied_reset_date = str(peak_meta.get("manual_reset_applied_date", "") or "").strip()
+            if applied_reset_date:
+                lines.append(
+                    "本次已按仓位转化日期执行峰值重置："
+                    f"{self._strategy_iso_date_to_zh_text(applied_reset_date) or applied_reset_date}"
+                )
         lines.append("")
 
         lookback_rows = list(inputs.get("fund_lookback_rows") or [])
@@ -1783,6 +2379,34 @@ class JijinUI(tk.Tk):
             f"\u5356\u503a\u4e70\u80a1\uff1a{self._strategy_fmt_money(summary.get('sell_bond_buy_stock_total'))} | "
             f"\u5356\u80a1\u4e70\u503a\uff1a{self._strategy_fmt_money(summary.get('sell_stock_buy_bond_total'))}"
         )
+        buy_calc = metrics.get("buy_calc") or {}
+        if isinstance(buy_calc, dict):
+            buy_total = to_float(buy_calc.get("buy_total"), default=0.0) or 0.0
+            if buy_total > 1e-8:
+                s_before = to_float(buy_calc.get("stock_total_before"), default=0.0) or 0.0
+                s_after = to_float(buy_calc.get("stock_total_after"), default=s_before + buy_total) or (s_before + buy_total)
+                lines.append("【买入分配计算过程】")
+                lines.append("规则：按“买入后股票总市值(S+A)”计算目标金额，再按差额分配到各基金。")
+                lines.append(
+                    f"S(买入前股票总市值)：{self._strategy_fmt_money(s_before)} | "
+                    f"A(本次买入总额)：{self._strategy_fmt_money(buy_total)} | "
+                    f"S+A：{self._strategy_fmt_money(s_after)}"
+                )
+                for row in list(buy_calc.get("funds") or []):
+                    code = str(row.get("code", "") or "").strip()
+                    if not code:
+                        continue
+                    name = str(self.fund_name_cache.get(code, "") or "").strip()
+                    fund_title = f"{name}({code})" if name else code
+                    cur_val = to_float(row.get("current_value"), default=0.0) or 0.0
+                    tgt_val = to_float(row.get("target_after_value"), default=0.0) or 0.0
+                    gap_val = to_float(row.get("gap_value"), default=0.0) or 0.0
+                    alloc_val = to_float(row.get("alloc_value"), default=0.0) or 0.0
+                    lines.append(
+                        f"- {fund_title} | 当前:{self._strategy_fmt_money(cur_val)} | 目标:{self._strategy_fmt_money(tgt_val)} | "
+                        f"差额:{self._strategy_fmt_money(gap_val)} | 分配:{self._strategy_fmt_money(alloc_val)}"
+                    )
+                lines.append("")
 
         def append_nonzero(title: str, data: Dict, note: Optional[str] = None) -> None:
             nonzero = [(k, to_float(v, default=0.0) or 0.0) for k, v in (data or {}).items()]
@@ -1816,13 +2440,6 @@ class JijinUI(tk.Tk):
                 f"\u672a\u5b8c\u6210\u5356\u51fa\u91d1\u989d\uff1a{self._strategy_fmt_money(output.get('unfilled_sell_amount'))}"
             )
             lines.append("")
-
-        lines.append("\u3010\u8f93\u51fa\u5b57\u6bb5\u542b\u4e49\u3011")
-        lines.append("- 动作：策略动作类型")
-        lines.append("- 原因：触发这次动作的原因")
-        lines.append("- 指标：决策时的指标快照(DD/W/S/B/C等)")
-        lines.append("- 指令：该次调仓的指令明细")
-        lines.append("- 新状态：执行后的新状态，下次决策会继续使用")
 
         return "\n".join(lines)
 
@@ -1886,15 +2503,24 @@ class JijinUI(tk.Tk):
                 )
 
             basket = stock_basket_index_equal_weights(nav_df, funds)
+            basket_for_decision, peak_cfg_before, peak_source = self._strategy_prepare_basket_with_peak_config(basket, today)
             result = decide(
                 today=today,
-                basket_idx=basket,
+                basket_idx=basket_for_decision,
                 bond_value=float(bond_value),
                 cash_value=float(cash_value),
                 stock_values=stock_values,
                 funds=funds,
                 params=params,
                 state=state,
+            )
+            peak_meta = self._strategy_update_peak_config(
+                result=result,
+                basket_used=basket_for_decision,
+                today=today,
+                params=params,
+                cfg_before=peak_cfg_before,
+                source=peak_source,
             )
 
             display_payload = {
@@ -1914,6 +2540,7 @@ class JijinUI(tk.Tk):
                     "lookback_end": today.date().isoformat(),
                     "latest_nav_date": latest_idx.date().isoformat(),
                     "fund_lookback_rows": lookback_rows,
+                    "peak_meta": peak_meta,
                 },
                 "output": result,
             }
