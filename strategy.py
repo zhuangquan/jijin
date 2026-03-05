@@ -395,32 +395,8 @@ def decide(
     dd_for_stage = dd_trade_raw if state.use_trade_peak_for_dd else dd_display_1y
     dd_mode = "trade_peak" if state.use_trade_peak_for_dd else "rolling_peak"
 
-    # 4) Frequency gating
-    if not _should_run_today(today, state.last_decision_date, params.decision_freq):
-        return {
-            "action": "HOLD",
-            "reason": f"freq_gate({params.decision_freq})",
-            "metrics": {
-                "today": today.date().isoformat(),
-                "basket_idx_today": idx_today,
-                "trade_anchor_date": anchor_date,
-                "peak_trade": float(state.trade_peak),
-                "dd_trade": dd_for_stage,
-                "dd_trade_raw": dd_trade_raw,
-                "dd_mode": dd_mode,
-                "peak_1y": peak_1y,
-                "dd_display_1y": dd_display_1y,
-                "pending_reset_date": state.pending_reset_date,
-                "last_stage_wait_conversion": bool(state.last_stage_wait_conversion),
-                "manual_reset_applied_date": manual_reset_applied_date,
-                "manual_reset_applied_peak": manual_reset_applied_peak,
-            },
-            "constraints_hit": [],
-            "unfilled_buy_amount": 0.0,
-            "unfilled_sell_amount": 0.0,
-            "orders": {},
-            "new_state": asdict(state),
-        }
+    # 4) Frequency gating (applies to DD_ADD only; FORCE_LOW/FORCE_HIGH always run)
+    should_run_today = _should_run_today(today, state.last_decision_date, params.decision_freq)
 
     # 5) Cooldown check
     in_cd = _in_cooldown(today, state.cooldown_until_date)
@@ -614,6 +590,39 @@ def decide(
     # ----------------------------
     # PRIORITY C: DD staged add (uses dd_trade) — only if NOT in cooldown
     # ----------------------------
+    if not should_run_today:
+        return {
+            "action": "HOLD",
+            "reason": f"freq_gate({params.decision_freq})",
+            "metrics": {
+                "today": today.date().isoformat(),
+                "basket_idx_today": idx_today,
+                "trade_anchor_date": anchor_date,
+                "peak_trade": float(state.trade_peak),
+                "dd_trade": dd_for_stage,
+                "dd_trade_raw": dd_trade_raw,
+                "dd_mode": dd_mode,
+                "peak_1y": peak_1y,
+                "dd_display_1y": dd_display_1y,
+                "S": S, "B": B, "C": C,
+                "decision_base": decision_base,
+                "W": W,
+                "target_stock_value": target_stock_value,
+                "gap_to_target": gap,
+                "cooldown_until_date": state.cooldown_until_date,
+                "dd_triggered": list(state.dd_triggered),
+                "pending_reset_date": state.pending_reset_date,
+                "last_stage_wait_conversion": bool(state.last_stage_wait_conversion),
+                "manual_reset_applied_date": manual_reset_applied_date,
+                "manual_reset_applied_peak": manual_reset_applied_peak,
+            },
+            "constraints_hit": [],
+            "unfilled_buy_amount": 0.0,
+            "unfilled_sell_amount": 0.0,
+            "orders": orders,
+            "new_state": asdict(state),
+        }
+
     if not in_cd:
         stage_to_fire = None
         fill_ratio = None

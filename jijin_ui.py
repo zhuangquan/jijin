@@ -41,6 +41,7 @@ DECISION_FREQ_LABEL_TO_VALUE = {
 }
 DECISION_FREQ_VALUE_TO_LABEL = {v: k for k, v in DECISION_FREQ_LABEL_TO_VALUE.items()}
 STRATEGY_PEAK_CONFIG_FILE = "strategy_peak.yaml"
+STRATEGY_UI_STATE_FILE = "strategy_ui_state.json"
 STRATEGY_FIXED_NEW_HIGH_EPS = 1e-10
 
 DEFAULT_CONFIG = {
@@ -1052,7 +1053,10 @@ class JijinUI(tk.Tk):
 
         self._strategy_reset_defaults(force=True)
         self._strategy_fill_from_portfolio()
-        self.strategy_status_var.set("点击“执行决策”后，计算完成会自动弹出中文解读结果窗口。")
+        if self._strategy_load_ui_state():
+            self.strategy_status_var.set("已加载上次“策略”参数配置。")
+        else:
+            self.strategy_status_var.set("点击“执行决策”后，计算完成会自动弹出中文解读结果窗口。")
 
     def _strategy_get_var(self, key: str, default, kind: str = "str") -> tk.Variable:
         if key in self.strategy_param_vars:
@@ -1191,6 +1195,7 @@ class JijinUI(tk.Tk):
             if tgt_var is not None:
                 tgt_var.set("")
             self._strategy_refresh_weights_preview()
+            self._strategy_save_ui_state()
             self.strategy_status_var.set("已清空股票子基权重，后续按默认等权执行")
             dialog.destroy()
 
@@ -1221,6 +1226,7 @@ class JijinUI(tk.Tk):
             if tgt_var is not None:
                 tgt_var.set(json.dumps(weights_pct, ensure_ascii=False))
             self._strategy_refresh_weights_preview()
+            self._strategy_save_ui_state()
             self.strategy_status_var.set("已更新股票子基权重（合计100%）")
             dialog.destroy()
 
@@ -1355,6 +1361,7 @@ class JijinUI(tk.Tk):
             dd_var.set(",".join(f"{self._strategy_format_percent_num(x)}%" for x in dd_pct))
             gap_var.set(",".join(f"{self._strategy_format_percent_num(x)}%" for x in gap_pct))
             self._strategy_refresh_dd_gap_preview()
+            self._strategy_save_ui_state()
             self.strategy_status_var.set("已更新回撤触发与补差额（3档）")
             dialog.destroy()
 
@@ -1378,9 +1385,10 @@ class JijinUI(tk.Tk):
         val = float(num)
         if val < 0:
             raise ValueError(f"{field_name} 不能为负数")
-        if has_pct:
-            return val / 100.0
-        return val / 100.0 if val > 1.0 else val
+        if val > 100:
+            raise ValueError(f"{field_name} 不能大于 100%")
+        # 占比类统一按“百分数输入”解析：1 => 1%
+        return val / 100.0
 
     @staticmethod
     def _strategy_ratio_to_percent_text(value: object) -> str:
@@ -1595,7 +1603,8 @@ class JijinUI(tk.Tk):
                 raise ValueError(f"{ratio_name} 不能大于 100%")
 
         if weights:
-            weights = {k: (v / 100.0 if v > 1 else v) for k, v in weights.items() if v > 0}
+            # 股票子基权重统一按百分数输入解析：1 => 1%
+            weights = {k: (v / 100.0) for k, v in weights.items() if v > 0}
 
         return {
             "target_stock_w": target_stock_w,
@@ -1833,7 +1842,8 @@ class JijinUI(tk.Tk):
 
     def _strategy_fill_from_portfolio(self) -> None:
         funds = self.get_all_fund_codes()
-        self.strategy_today_var.set(dt.date.today().isoformat())
+        if not self.strategy_today_var.get().strip():
+            self.strategy_today_var.set(dt.date.today().isoformat())
         bond_market = float(self._compute_bond_portfolio_summary().get("market", 0.0))
         self.strategy_bond_value_var.set(f"{bond_market:.2f}")
         if not self.strategy_cash_value_var.get().strip():
@@ -1847,6 +1857,97 @@ class JijinUI(tk.Tk):
             stock_values[code] = float(shares_map.get(code, 0.0)) * nav
         self.strategy_stock_values_var.set(json.dumps(stock_values, ensure_ascii=False))
         self.strategy_status_var.set(f"\u5df2\u6309\u5f53\u524d\u6301\u4ed3\u586b\u5145\u7b56\u7565\u8f93\u5165\uff08\u503a\u57fa={bond_market:.2f}\uff09")
+
+    @staticmethod
+    def _strategy_ui_state_path() -> Path:
+        return Path("data") / STRATEGY_UI_STATE_FILE
+
+    def _strategy_save_ui_state(self) -> None:
+        try:
+            path = self._strategy_ui_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            param_raw = {k: str(v.get()) for k, v in self.strategy_param_vars.items()}
+            payload: Dict = {
+                "saved_at": dt.datetime.now().isoformat(timespec="seconds"),
+                "base": {
+                    "today": str(self.strategy_today_var.get() or "").strip(),
+                    "history_days": str(self.strategy_history_days_var.get() or "").strip(),
+                    "cash_value": str(self.strategy_cash_value_var.get() or "").strip(),
+                },
+                "date_parts": {
+                    "year": str(self.strategy_reset_year_var.get() or "").strip(),
+                    "month": str(self.strategy_reset_month_var.get() or "").strip(),
+                    "day": str(self.strategy_reset_day_var.get() or "").strip(),
+                },
+                "param_raw": param_raw,
+                "state_json": self._strategy_text_get(self.strategy_state_text) or self.strategy_state_json_cache,
+                "params_json": self._strategy_text_get(self.strategy_params_text) or self.strategy_params_json_cache,
+            }
+            try:
+                payload["params_parsed"] = self._strategy_collect_params_from_form()
+            except Exception:
+                pass
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _strategy_load_ui_state(self) -> bool:
+        path = self._strategy_ui_state_path()
+        if not path.exists():
+            return False
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return False
+        except Exception:
+            return False
+
+        try:
+            base = raw.get("base") or {}
+            if isinstance(base, dict):
+                today = str(base.get("today", "") or "").strip()
+                hist = str(base.get("history_days", "") or "").strip()
+                cash = str(base.get("cash_value", "") or "").strip()
+                if today:
+                    self.strategy_today_var.set(today)
+                if hist:
+                    self.strategy_history_days_var.set(hist)
+                if cash:
+                    self.strategy_cash_value_var.set(cash)
+
+            param_raw = raw.get("param_raw") or {}
+            if isinstance(param_raw, dict):
+                for k, v in param_raw.items():
+                    if k in self.strategy_param_vars:
+                        self.strategy_param_vars[k].set(str(v))
+
+            date_parts = raw.get("date_parts") or {}
+            if isinstance(date_parts, dict):
+                self.strategy_reset_year_var.set(str(date_parts.get("year", "") or "").strip())
+                self.strategy_reset_month_var.set(str(date_parts.get("month", "") or "").strip())
+                self.strategy_reset_day_var.set(str(date_parts.get("day", "") or "").strip())
+            if not (
+                self.strategy_reset_year_var.get().strip()
+                or self.strategy_reset_month_var.get().strip()
+                or self.strategy_reset_day_var.get().strip()
+            ):
+                if isinstance(param_raw, dict):
+                    self._strategy_set_reset_date_from_value(param_raw.get("last_stage_reset_date"))
+
+            state_json = raw.get("state_json")
+            if isinstance(state_json, str) and state_json.strip():
+                self.strategy_state_json_cache = state_json
+                self._strategy_text_set(self.strategy_state_text, state_json)
+            params_json = raw.get("params_json")
+            if isinstance(params_json, str) and params_json.strip():
+                self.strategy_params_json_cache = params_json
+                self._strategy_text_set(self.strategy_params_text, params_json)
+
+            self._strategy_refresh_dd_gap_preview()
+            self._strategy_refresh_weights_preview()
+            return True
+        except Exception:
+            return False
 
     def _strategy_peak_config_path(self) -> Path:
         base_dir = self.config_path.parent if self.config_path else Path("config")
@@ -2573,6 +2674,7 @@ class JijinUI(tk.Tk):
         self._strategy_text_set(self.strategy_output_cn_text, output_cn)
         self._strategy_text_set(self.strategy_output_text, output_json)
         self._strategy_text_set(self.strategy_state_text, state_json)
+        self._strategy_save_ui_state()
         action_zh = self._strategy_action_zh(str(result.get("action", "-")))
         self.strategy_status_var.set(
             f"\u6267\u884c\u6210\u529f\uff1a{action_zh}\uff0c\u51b3\u7b56\u65e5={today.date().isoformat()}\uff0c\u6807\u7684\u6570={len(funds)}"
@@ -2585,6 +2687,7 @@ class JijinUI(tk.Tk):
         self.strategy_status_var.set(f"\u6267\u884c\u5931\u8d25\uff1a{err_zh}")
         self._strategy_text_set(self.strategy_output_cn_text, f"\u6267\u884c\u5931\u8d25\uff1a{err_zh}")
         self._strategy_text_set(self.strategy_output_text, f"\u6267\u884c\u5931\u8d25\uff1a{err_zh}")
+        self._strategy_save_ui_state()
         self._set_strategy_running(False)
 
     def _run_strategy_decision(self) -> None:
@@ -2610,6 +2713,7 @@ class JijinUI(tk.Tk):
             params_input = self._strategy_collect_params_from_form()
             self.strategy_params_json_cache = json.dumps(params_input, ensure_ascii=False, indent=2)
             self._strategy_text_set(self.strategy_params_text, self.strategy_params_json_cache)
+            self._strategy_save_ui_state()
             params = self._strategy_parse_params(funds, data_override=params_input)
             state = self._strategy_parse_state()
             state_input = json.loads((self._strategy_text_get(self.strategy_state_text) or self.strategy_state_json_cache or "{}"))
@@ -2814,6 +2918,9 @@ class JijinUI(tk.Tk):
                     finally:
                         self._is_switching_tab = False
                     return
+            leaving_strategy = self.strategy_tab is not None and previous_tab == str(self.strategy_tab) and current_tab != previous_tab
+            if leaving_strategy:
+                self._strategy_save_ui_state()
 
         if self.analysis_tab is not None and current_tab == str(self.analysis_tab):
             self.refresh_analysis_view(fetch_latest=True)
@@ -2824,6 +2931,7 @@ class JijinUI(tk.Tk):
         action = self._ask_save_settings_action(for_close=True)
         if action == "cancel":
             return
+        self._strategy_save_ui_state()
         if self._overlay_job:
             try:
                 self.after_cancel(self._overlay_job)
