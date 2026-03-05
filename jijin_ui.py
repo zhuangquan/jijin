@@ -1,4 +1,5 @@
 ﻿import argparse
+import concurrent.futures
 import copy
 import datetime as dt
 import json
@@ -638,6 +639,8 @@ class JijinUI(tk.Tk):
         self.strategy_bond_value_var = tk.StringVar(value="0")
         self.strategy_cash_value_var = tk.StringVar(value="0")
         self.strategy_stock_values_var = tk.StringVar(value="")
+        self.strategy_trade_peak_var = tk.StringVar(value="-")
+        self.strategy_trade_peak_date_var = tk.StringVar(value="-")
         self.strategy_param_vars: Dict[str, tk.Variable] = {}
         self.strategy_weights_preview_var = tk.StringVar(value="未配置（默认等权）")
         self.strategy_dd_gap_preview_var = tk.StringVar(value="未配置")
@@ -653,6 +656,8 @@ class JijinUI(tk.Tk):
         self.strategy_output_json_cache = ""
         self.strategy_run_btn: Optional[ttk.Button] = None
         self._strategy_running = False
+        self._strategy_nav_series_cache: Dict[str, pd.Series] = {}
+        self._strategy_nav_series_cached_at: Dict[str, dt.datetime] = {}
         self.vars: Dict[str, tk.Variable] = {
             "app.xlsx_path": tk.StringVar(),
             "app.threshold": tk.StringVar(),
@@ -662,7 +667,7 @@ class JijinUI(tk.Tk):
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_window_close)
         self.apply_config_to_form()
-        self.load_transactions_from_doc(silent=True)
+        self.load_transactions_from_doc(silent=True, fetch_latest_bond=False)
         self.after(80, self._run_startup_sync_and_notify_once)
 
     def _init_theme(self) -> None:
@@ -1045,6 +1050,11 @@ class JijinUI(tk.Tk):
         self.strategy_run_btn.grid(row=0, column=0, sticky="w")
         ttk.Entry(btns, textvariable=self.strategy_status_var, state="readonly").grid(row=0, column=1, padx=(10, 0), sticky="ew")
 
+        ttk.Label(base_box, text="交易峰值", style="Body.TLabel").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(base_box, textvariable=self.strategy_trade_peak_var, state="readonly", width=16).grid(row=3, column=1, sticky="w", padx=(6, 0), pady=(6, 0))
+        ttk.Label(base_box, text="更新日期", style="Body.TLabel").grid(row=3, column=2, sticky="w", pady=(6, 0), padx=(8, 0))
+        ttk.Entry(base_box, textvariable=self.strategy_trade_peak_date_var, state="readonly", width=16).grid(row=3, column=3, sticky="w", padx=(6, 0), pady=(6, 0))
+
         params_box = ttk.LabelFrame(frame, text="策略参数（表单）", padding=6, style="Summary.TLabelframe")
         params_box.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
         params_box.columnconfigure(0, weight=1)
@@ -1057,6 +1067,7 @@ class JijinUI(tk.Tk):
             self.strategy_status_var.set("已加载上次“策略”参数配置。")
         else:
             self.strategy_status_var.set("点击“执行决策”后，计算完成会自动弹出中文解读结果窗口。")
+        self._strategy_refresh_trade_peak_display_from_config()
 
     def _strategy_get_var(self, key: str, default, kind: str = "str") -> tk.Variable:
         if key in self.strategy_param_vars:
@@ -1953,6 +1964,23 @@ class JijinUI(tk.Tk):
         base_dir = self.config_path.parent if self.config_path else Path("config")
         return base_dir / STRATEGY_PEAK_CONFIG_FILE
 
+    def _strategy_set_trade_peak_display(self, peak_value: Optional[float], peak_date: str) -> None:
+        if peak_value is None:
+            self.strategy_trade_peak_var.set("-")
+        else:
+            self.strategy_trade_peak_var.set(f"{float(peak_value):.6f}")
+        d = parse_date(peak_date)
+        self.strategy_trade_peak_date_var.set(d if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) else "-")
+
+    def _strategy_refresh_trade_peak_display_from_config(self) -> None:
+        cfg = self._strategy_load_peak_config()
+        peak_value = to_float(cfg.get("trade_peak_value"), default=None)
+        peak_date = str(cfg.get("trade_peak_update_date", "") or "")
+        if peak_value is None:
+            peak_value = to_float(cfg.get("peak_value"), default=None)
+            peak_date = str(cfg.get("peak_date", "") or peak_date)
+        self._strategy_set_trade_peak_display(peak_value, peak_date)
+
     def _strategy_load_peak_config(self) -> Dict:
         path = self._strategy_peak_config_path()
         if not path.exists():
@@ -1967,6 +1995,8 @@ class JijinUI(tk.Tk):
                 "peak_value": float(peak_value) if peak_value is not None else None,
                 "peak_date": peak_date if peak_date else "",
                 "pending_reset_date": parse_date(raw.get("pending_reset_date")),
+                "trade_peak_value": to_float(raw.get("trade_peak_value"), default=None),
+                "trade_peak_update_date": parse_date(raw.get("trade_peak_update_date")),
                 "reason": str(raw.get("reason", "") or ""),
                 "updated_at": str(raw.get("updated_at", "") or ""),
             }
@@ -1980,6 +2010,8 @@ class JijinUI(tk.Tk):
             "peak_value": float(to_float(data.get("peak_value"), default=0.0) or 0.0),
             "peak_date": str(data.get("peak_date", "") or ""),
             "pending_reset_date": str(data.get("pending_reset_date", "") or ""),
+            "trade_peak_value": to_float(data.get("trade_peak_value"), default=None),
+            "trade_peak_update_date": str(data.get("trade_peak_update_date", "") or ""),
             "reason": str(data.get("reason", "") or ""),
             "updated_at": str(data.get("updated_at", "") or ""),
         }
@@ -2032,12 +2064,22 @@ class JijinUI(tk.Tk):
         pending_reset_date = str(new_state.get("pending_reset_date", "") or "").strip()
         manual_reset_applied_date = str(metrics.get("manual_reset_applied_date", "") or "").strip()
         manual_reset_applied_peak = to_float(metrics.get("manual_reset_applied_peak"), default=None)
+        trade_peak_val = to_float(metrics.get("peak_trade"), default=None)
+        trade_peak_date = today.date().isoformat()
+
+        if trade_peak_val is not None:
+            cfg_after["trade_peak_value"] = float(trade_peak_val)
+            cfg_after["trade_peak_update_date"] = trade_peak_date
+            cfg_after["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
+            self._strategy_save_peak_config(cfg_after)
 
         if manual_reset_applied_date and manual_reset_applied_peak is not None:
             cfg_after = {
                 "peak_value": float(manual_reset_applied_peak),
                 "peak_date": manual_reset_applied_date,
                 "pending_reset_date": "",
+                "trade_peak_value": cfg_after.get("trade_peak_value"),
+                "trade_peak_update_date": cfg_after.get("trade_peak_update_date", trade_peak_date),
                 "reason": "manual_reset_applied",
                 "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
             }
@@ -2095,6 +2137,8 @@ class JijinUI(tk.Tk):
                     "peak_value": float(decision_peak_value or 0.0),
                     "peak_date": decision_peak_date,
                     "reason": "new_high_update" if should_new_high else "init_from_decision_peak",
+                    "trade_peak_value": cfg_after.get("trade_peak_value"),
+                    "trade_peak_update_date": cfg_after.get("trade_peak_update_date", trade_peak_date),
                     "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
                 }
                 self._strategy_save_peak_config(cfg_after)
@@ -2109,6 +2153,8 @@ class JijinUI(tk.Tk):
             "config_peak_value": to_float(cfg_after.get("peak_value"), default=None),
             "config_peak_date": str(cfg_after.get("peak_date", "") or ""),
             "config_pending_reset_date": str(cfg_after.get("pending_reset_date", "") or ""),
+            "trade_peak_value": to_float(cfg_after.get("trade_peak_value"), default=trade_peak_val),
+            "trade_peak_update_date": str(cfg_after.get("trade_peak_update_date", "") or trade_peak_date),
             "config_reason": str(cfg_after.get("reason", "") or ""),
             "config_updated_at": str(cfg_after.get("updated_at", "") or ""),
             "config_updated": config_updated,
@@ -2122,19 +2168,56 @@ class JijinUI(tk.Tk):
         series_map: Dict[str, pd.Series] = {}
         errors: List[str] = []
         active_session = session or self.session
-        # Fetch only as much history as needed, with a buffer for alignment.
         need_days = max(1, int(history_days))
         fetch_days = max(need_days + 120, need_days * 2)
         max_pages = max(5, min(120, int(math.ceil(fetch_days / 20.0))))
+
+        # Short TTL cache to speed up repeated "执行决策".
+        now = dt.datetime.now()
+        cache_ttl = dt.timedelta(minutes=10)
+        pending_codes: List[str] = []
         for code in funds:
-            try:
-                series_map[code] = fetch_nav_history_series(code, active_session, max_pages=max_pages)
-            except Exception as exc:
-                errors.append(f"{code}: {exc}")
+            cached = self._strategy_nav_series_cache.get(code)
+            cached_at = self._strategy_nav_series_cached_at.get(code)
+            if cached is not None and cached_at is not None and (now - cached_at) <= cache_ttl and len(cached) >= need_days:
+                series_map[code] = cached.copy()
+            else:
+                pending_codes.append(code)
+
+        if pending_codes:
+            if len(pending_codes) == 1:
+                code = pending_codes[0]
+                try:
+                    s = fetch_nav_history_series(code, active_session, max_pages=max_pages)
+                    series_map[code] = s
+                    self._strategy_nav_series_cache[code] = s
+                    self._strategy_nav_series_cached_at[code] = now
+                except Exception as exc:
+                    errors.append(f"{code}: {exc}")
+            else:
+                workers = max(2, min(6, len(pending_codes)))
+
+                def _fetch_one(code: str) -> Tuple[str, pd.Series]:
+                    with requests.Session() as sess:
+                        s = fetch_nav_history_series(code, sess, max_pages=max_pages)
+                    return code, s
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                    future_map = {ex.submit(_fetch_one, code): code for code in pending_codes}
+                    for fut in concurrent.futures.as_completed(future_map):
+                        code = future_map[fut]
+                        try:
+                            c, s = fut.result()
+                            series_map[c] = s
+                            self._strategy_nav_series_cache[c] = s
+                            self._strategy_nav_series_cached_at[c] = now
+                        except Exception as exc:
+                            errors.append(f"{code}: {exc}")
+
         if errors:
             raise ValueError("\u83b7\u53d6\u51c0\u503c\u5386\u53f2\u5931\u8d25:\n" + "\n".join(errors[:5]))
 
-        nav_df = pd.concat(series_map, axis=1).sort_index()
+        nav_df = pd.concat({k: series_map[k] for k in funds if k in series_map}, axis=1).sort_index()
         nav_df = nav_df.ffill().dropna(how="any")
         if history_days > 0:
             nav_df = nav_df.tail(history_days)
@@ -2414,6 +2497,8 @@ class JijinUI(tk.Tk):
         if peak_meta:
             cfg_peak_val = to_float(peak_meta.get("config_peak_value"), default=None)
             cfg_peak_date = str(peak_meta.get("config_peak_date", "") or "-")
+            trade_peak_val = to_float(peak_meta.get("trade_peak_value"), default=None)
+            trade_peak_date = str(peak_meta.get("trade_peak_update_date", "") or "-")
             decision_peak_val = to_float(peak_meta.get("decision_peak_value"), default=None)
             decision_peak_date = str(peak_meta.get("decision_peak_date", "") or "-")
             source = str(peak_meta.get("source", "") or "")
@@ -2423,6 +2508,10 @@ class JijinUI(tk.Tk):
                 "peak_config_ignored": "峰值配置日期超出可用范围，已忽略",
             }.get(source, source or "-")
             lines.append("\u3010峰值基准信息\u3011")
+            if trade_peak_val is not None:
+                lines.append(f"交易峰值：{trade_peak_val:.6f}（更新日期：{trade_peak_date}）")
+            else:
+                lines.append("交易峰值：-")
             if cfg_peak_val is not None:
                 lines.append(f"配置峰值：{cfg_peak_val:.6f}（根据 {cfg_peak_date} 净值更新）")
             else:
@@ -2674,6 +2763,11 @@ class JijinUI(tk.Tk):
         self._strategy_text_set(self.strategy_output_cn_text, output_cn)
         self._strategy_text_set(self.strategy_output_text, output_json)
         self._strategy_text_set(self.strategy_state_text, state_json)
+        peak_meta = display_payload.get("inputs", {}).get("peak_meta", {}) or {}
+        self._strategy_set_trade_peak_display(
+            to_float(peak_meta.get("trade_peak_value"), default=None),
+            str(peak_meta.get("trade_peak_update_date", "") or ""),
+        )
         self._strategy_save_ui_state()
         action_zh = self._strategy_action_zh(str(result.get("action", "-")))
         self.strategy_status_var.set(
@@ -2800,7 +2894,7 @@ class JijinUI(tk.Tk):
         if path:
             self.vars["app.xlsx_path"].set(path)
 
-    def load_transactions_from_doc(self, silent: bool = False) -> None:
+    def load_transactions_from_doc(self, silent: bool = False, fetch_latest_bond: bool = True) -> None:
         try:
             self.collect_form_to_config()
             xlsx_path = Path(self.config["app"]["xlsx_path"])
@@ -2820,7 +2914,7 @@ class JijinUI(tk.Tk):
             self.sheet_fund_codes = sorted(set(sheet_name_map.keys()) | {txn["fund_code"] for txn in self.transactions})
             self.refresh_fund_list(keep_current=False)
             self.refresh_fund_view()
-            self.refresh_bond_view(fetch_latest=True)
+            self.refresh_bond_view(fetch_latest=fetch_latest_bond)
             self.refresh_analysis_view()
             self._strategy_fill_from_portfolio()
         except Exception as exc:
@@ -3615,34 +3709,62 @@ class JijinUI(tk.Tk):
             threshold = to_float(self.config.get("app", {}).get("threshold", 0.40), default=0.40)
         threshold = float(threshold if threshold is not None else 0.40)
 
-        notify_rows: List[Tuple[str, Dict, float]] = []
+        t = threading.Thread(
+            target=self._startup_sync_worker,
+            args=(fund_codes, ntfy_url, threshold),
+            daemon=True,
+        )
+        t.start()
+
+    def _startup_sync_worker(self, fund_codes: List[str], ntfy_url: str, threshold: float) -> None:
+        nav_map: Dict[str, Tuple[str, float]] = {}
         nav_errors: List[str] = []
-        for code in fund_codes:
-            try:
-                nav_date, latest_nav = fetch_latest_nav(code, self.session)
-                self.latest_nav_cache[code] = (nav_date, latest_nav)
-            except Exception as exc:
-                nav_errors.append(f"{code}: {exc}")
-                continue
+        with requests.Session() as sess:
+            for code in fund_codes:
+                try:
+                    nav_date, latest_nav = fetch_latest_nav(code, sess)
+                    nav_map[code] = (nav_date, latest_nav)
+                except Exception as exc:
+                    nav_errors.append(f"{code}: {exc}")
+        self.after(0, lambda: self._startup_sync_apply(nav_map, nav_errors, ntfy_url, threshold))
 
-            rows, _ = self.build_display_rows(code, latest_nav)
-            for row in rows:
-                rate_val = row.get("rate_sort")
-                if rate_val is None or float(rate_val) < threshold:
-                    continue
-                notify_rows.append((code, row, latest_nav))
+    def _startup_sync_apply(self, nav_map: Dict[str, Tuple[str, float]], nav_errors: List[str], ntfy_url: str, threshold: float) -> None:
+        if nav_map:
+            self.latest_nav_cache.update(nav_map)
+            self.refresh_fund_view()
+            self._save_trade_doc()
 
-        self.refresh_fund_view()
-        self._save_trade_doc()
+        if ntfy_url:
+            notify_rows: List[Tuple[str, Dict, float, str]] = []
+            for code, (nav_date, latest_nav) in nav_map.items():
+                rows, _ = self.build_display_rows(code, latest_nav)
+                for row in rows:
+                    rate_val = row.get("rate_sort")
+                    if rate_val is None or float(rate_val) < threshold:
+                        continue
+                    notify_rows.append((code, row, latest_nav, nav_date))
+            if notify_rows:
+                t = threading.Thread(
+                    target=self._startup_notify_worker,
+                    args=(ntfy_url, threshold, notify_rows, nav_errors),
+                    daemon=True,
+                )
+                t.start()
+                return
 
-        if not ntfy_url:
-            if nav_errors:
-                messagebox.showwarning("\u51c0\u503c\u66f4\u65b0\u63d0\u793a", "\u90e8\u5206\u57fa\u91d1\u51c0\u503c\u66f4\u65b0\u5931\u8d25\uff1a\n" + "\n".join(nav_errors[:3]))
-            return
+        if nav_errors:
+            messagebox.showwarning("\u51c0\u503c\u66f4\u65b0\u63d0\u793a", "\u90e8\u5206\u57fa\u91d1\u51c0\u503c\u66f4\u65b0\u5931\u8d25\uff1a\n" + "\n".join(nav_errors[:3]))
 
-        errors = []
-        for code, row, latest_nav in notify_rows:
-            nav_date = str(self.latest_nav_cache.get(code, ("", latest_nav))[0])
+    def _startup_notify_worker(
+        self,
+        ntfy_url: str,
+        threshold: float,
+        notify_rows: List[Tuple[str, Dict, float, str]],
+        nav_errors: List[str],
+    ) -> None:
+        errors: List[str] = []
+        sent_keys: List[str] = []
+        for code, row, latest_nav, nav_date in notify_rows:
             alert_key = f"startup|{code}|{row['uid']}|{nav_date}|{latest_nav:.6f}|{threshold:.6f}"
             if alert_key in self.ntfy_sent_cache:
                 continue
@@ -3658,10 +3780,14 @@ class JijinUI(tk.Tk):
             ]
             try:
                 send_ntfy(ntfy_url, title="基金收益提醒", message="\n".join(lines), tags="moneybag,rotating_light")
-                self.ntfy_sent_cache.add(alert_key)
+                sent_keys.append(alert_key)
             except Exception as exc:
                 errors.append(str(exc))
+        self.after(0, lambda: self._startup_notify_finish(sent_keys, errors, nav_errors))
 
+    def _startup_notify_finish(self, sent_keys: List[str], errors: List[str], nav_errors: List[str]) -> None:
+        for key in sent_keys:
+            self.ntfy_sent_cache.add(key)
         if errors:
             messagebox.showerror("\u901a\u77e5\u5931\u8d25", f"ntfy \u53d1\u9001\u5931\u8d25\uff1a\n{errors[0]}")
         elif nav_errors:
@@ -4150,3 +4276,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
