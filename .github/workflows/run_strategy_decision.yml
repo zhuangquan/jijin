@@ -1,0 +1,57 @@
+name: Run Strategy Decision
+
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC 13:40 = Beijing 21:40, run every day
+    - cron: "40 13 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run strategy decision
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+        run: |
+          python run_strategy_decision.py --config config/funds.yaml --state data/strategy_ui_state.json
+
+      - name: Commit strategy state
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/strategy_ui_state.json config/strategy_peak.yaml
+          if git diff --cached --quiet; then
+            echo "No strategy state changes."
+            exit 0
+          fi
+          git commit -m "chore: nightly strategy decision state update [skip ci]"
+          git push origin "HEAD:${{ github.ref_name }}"
+
+      - name: Upload strategy artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy-decision-output
+          path: |
+            data/strategy_ui_state.json
+            config/strategy_peak.yaml
+          if-no-files-found: warn

@@ -610,7 +610,7 @@ def run_job(config: Dict, xlsx_override: str, out_override: str, threshold_overr
 
     write_output(xlsx_path, output_path, summaries)
 
-    if ntfy_url:
+    if ntfy_url and threshold > 0:
         has_threshold_alert = False
         for code, fund_txns in sorted(by_fund.items()):
             s = summaries.get(code)
@@ -693,6 +693,8 @@ def run_job(config: Dict, xlsx_override: str, out_override: str, threshold_overr
                     message="\n".join(lines),
                     tags="moneybag,bar_chart",
                 )
+    elif ntfy_url and threshold <= 0:
+        print("threshold <= 0, skip profit-threshold ntfy notifications.")
 
     handle_repo_activity(app, ntfy_url, session)
 

@@ -50,6 +50,7 @@ DEFAULT_CONFIG = {
         "xlsx_path": "data/jijin.xlsx",
         "threshold": 0.40,
         "ntfy_url": "",
+        "decision_notify": False,
     },
     "funds": [],
 }
@@ -662,6 +663,7 @@ class JijinUI(tk.Tk):
             "app.xlsx_path": tk.StringVar(),
             "app.threshold": tk.StringVar(),
             "app.ntfy_url": tk.StringVar(),
+            "app.decision_notify": tk.BooleanVar(value=False),
         }
 
         self._build_ui()
@@ -2773,6 +2775,7 @@ class JijinUI(tk.Tk):
         self.strategy_status_var.set(
             f"\u6267\u884c\u6210\u529f\uff1a{action_zh}\uff0c\u51b3\u7b56\u65e5={today.date().isoformat()}\uff0c\u6807\u7684\u6570={len(funds)}"
         )
+        self._notify_strategy_result_if_needed(output_cn, success=True)
         self._show_strategy_result_dialog(params_cn, state_cn, output_cn)
         self._set_strategy_running(False)
 
@@ -2782,7 +2785,73 @@ class JijinUI(tk.Tk):
         self._strategy_text_set(self.strategy_output_cn_text, f"\u6267\u884c\u5931\u8d25\uff1a{err_zh}")
         self._strategy_text_set(self.strategy_output_text, f"\u6267\u884c\u5931\u8d25\uff1a{err_zh}")
         self._strategy_save_ui_state()
+        self._notify_strategy_result_if_needed(f"\u6267\u884c\u5931\u8d25\uff1a{err_zh}", success=False)
         self._set_strategy_running(False)
+
+    @staticmethod
+    def _parse_bool(value: object, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value or "").strip().lower()
+        if not text:
+            return default
+        if text in {"1", "true", "yes", "on", "y", "是", "开启"}:
+            return True
+        if text in {"0", "false", "no", "off", "n", "否", "关闭"}:
+            return False
+        return default
+
+    def _notify_strategy_result_if_needed(self, message: str, success: bool) -> None:
+        enabled = self._parse_bool(self.vars["app.decision_notify"].get(), default=False)
+        if not enabled:
+            return
+        url_text = self.vars["app.ntfy_url"].get().strip() or str(self.config.get("app", {}).get("ntfy_url", "")).strip()
+        ntfy_url = normalize_ntfy_url(url_text)
+        if not ntfy_url:
+            return
+
+        title = "Strategy Decision Success" if success else "Strategy Decision Failed"
+        t = threading.Thread(
+            target=self._notify_strategy_result_worker,
+            args=(ntfy_url, title, str(message or "").strip() or "-"),
+            daemon=True,
+        )
+        t.start()
+
+    def _notify_strategy_result_worker(self, ntfy_url: str, title: str, message: str) -> None:
+        try:
+            send_ntfy(ntfy_url, title=title, message=message, tags="moneybag,memo")
+        except Exception as exc:
+            self.after(0, lambda: messagebox.showerror("\u901a\u77e5\u5931\u8d25", f"ntfy \u53d1\u9001\u5931\u8d25\uff1a\n{exc}"))
+
+    def _strategy_sync_latest_nav_before_run(self, funds: List[str], cash_value: float) -> float:
+        all_codes = self._collect_analysis_codes()
+        if all_codes:
+            self.strategy_status_var.set(f"\u6267\u884c\u4e2d\uff1a\u6b63\u5728\u66f4\u65b0{len(all_codes)}\u53ea\u57fa\u91d1\u6700\u65b0\u51c0\u503c\u2026")
+            self.update_idletasks()
+            nav_errors = self._refresh_latest_nav_for_codes(all_codes)
+            if nav_errors:
+                head = "\uff1b".join(nav_errors[:3])
+                tail = f"\uff08\u53e6\u5916{len(nav_errors) - 3}\u53ea\u57fa\u91d1\u5931\u8d25\uff09" if len(nav_errors) > 3 else ""
+                raise ValueError(f"\u66f4\u65b0\u6700\u65b0\u51c0\u503c\u5931\u8d25\uff1a{head}{tail}")
+
+        shares_map = self._strategy_current_stock_shares(funds)
+        stock_values: Dict[str, float] = {}
+        for code in funds:
+            latest = self.get_latest_nav_cached(code)
+            latest_nav = float(latest[1]) if latest and latest[1] is not None else 0.0
+            stock_values[code] = float(shares_map.get(code, 0.0)) * latest_nav
+
+        bond_value = float(self._compute_bond_portfolio_summary().get("market", 0.0))
+        stock_total = float(sum(stock_values.values()))
+        total_value = stock_total + float(bond_value) + float(cash_value)
+        self.strategy_bond_value_var.set(f"{bond_value:.2f}")
+        self.strategy_stock_values_var.set(json.dumps(stock_values, ensure_ascii=False))
+        self.strategy_status_var.set(f"\u6267\u884c\u4e2d\uff1a\u6700\u65b0\u51c0\u503c\u5df2\u540c\u6b65\uff0c\u6700\u65b0\u603b\u91d1\u989d={total_value:.2f}\uff0c\u51c6\u5907\u6267\u884c\u51b3\u7b56\u2026")
+        self.update_idletasks()
+        return bond_value
 
     def _run_strategy_decision(self) -> None:
         if self._strategy_running:
@@ -2795,11 +2864,10 @@ class JijinUI(tk.Tk):
 
             history_days = int(to_float(self.strategy_history_days_var.get(), default=260) or 260)
             history_days = max(1, history_days)
-            bond_value = float(self._compute_bond_portfolio_summary().get("market", 0.0))
-            self.strategy_bond_value_var.set(f"{bond_value:.2f}")
             cash_value = to_float(self.strategy_cash_value_var.get(), default=None)
             if cash_value is None:
                 raise ValueError("\u73b0\u91d1\u91d1\u989d\u5fc5\u987b\u4e3a\u6570\u5b57")
+            bond_value = self._strategy_sync_latest_nav_before_run(funds, float(cash_value))
 
             today_raw = parse_date(self.strategy_today_var.get().strip())
             desired_today = pd.Timestamp(today_raw) if today_raw else None
@@ -2842,10 +2910,11 @@ class JijinUI(tk.Tk):
             self.strategy_status_var.set(f"\u6267\u884c\u5931\u8d25\uff1a{err_zh}")
             self._strategy_text_set(self.strategy_output_cn_text, f"\u6267\u884c\u5931\u8d25\uff1a{err_zh}")
             self._strategy_text_set(self.strategy_output_text, f"\u6267\u884c\u5931\u8d25\uff1a{err_zh}")
+            self._notify_strategy_result_if_needed(f"\u6267\u884c\u5931\u8d25\uff1a{err_zh}", success=False)
 
     def _build_general_tab(self, frame: ttk.Frame) -> None:
         frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(3, weight=0)
+        frame.rowconfigure(4, weight=0)
 
         ttk.Label(frame, text="\u4ea4\u6613\u6587\u6863", style="Body.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Entry(frame, textvariable=self.vars["app.xlsx_path"]).grid(row=0, column=1, sticky="ew", padx=6)
@@ -2858,8 +2927,25 @@ class JijinUI(tk.Tk):
         ttk.Label(frame, text="ntfy_url", style="Body.TLabel").grid(row=2, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(frame, textvariable=self.vars["app.ntfy_url"]).grid(row=2, column=1, columnspan=3, sticky="ew", padx=6, pady=(8, 0))
 
+        ttk.Label(frame, text="\u51b3\u7b56\u901a\u77e5", style="Body.TLabel").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        tk.Checkbutton(
+            frame,
+            text="",
+            variable=self.vars["app.decision_notify"],
+            onvalue=True,
+            offvalue=False,
+            indicatoron=True,
+            bg=self.colors["bg"],
+            activebackground=self.colors["bg"],
+            selectcolor=self.colors["surface"],
+            highlightthickness=0,
+            bd=0,
+            padx=0,
+            pady=0,
+        ).grid(row=3, column=1, sticky="w", padx=(6, 0), pady=(8, 0))
+
         ttk.Button(frame, text="\u4fdd\u5b58\u901a\u7528\u8bbe\u7f6e", command=self.save_settings_only, style="Primary.TButton").grid(
-            row=3, column=0, columnspan=4, pady=(12, 0), sticky="e"
+            row=4, column=0, columnspan=4, pady=(12, 0), sticky="e"
         )
 
     def apply_config_to_form(self) -> None:
@@ -2867,6 +2953,7 @@ class JijinUI(tk.Tk):
         self.vars["app.xlsx_path"].set(str(app.get("xlsx_path", "data/jijin.xlsx")))
         self.vars["app.threshold"].set(str(app.get("threshold", 0.40)))
         self.vars["app.ntfy_url"].set(str(app.get("ntfy_url", "")))
+        self.vars["app.decision_notify"].set(self._parse_bool(app.get("decision_notify", False), default=False))
 
     def collect_form_to_config(self) -> None:
         threshold_text = self.vars["app.threshold"].get().strip() or "0.40"
@@ -2879,6 +2966,7 @@ class JijinUI(tk.Tk):
         self.config["app"]["xlsx_path"] = self.vars["app.xlsx_path"].get().strip() or "data/jijin.xlsx"
         self.config["app"]["threshold"] = threshold
         self.config["app"]["ntfy_url"] = self.vars["app.ntfy_url"].get().strip()
+        self.config["app"]["decision_notify"] = self._parse_bool(self.vars["app.decision_notify"].get(), default=False)
         self.config["app"].pop("notify_all", None)
 
         funds = sorted(set(self.get_all_fund_codes()))
@@ -2955,6 +3043,7 @@ class JijinUI(tk.Tk):
         self.vars["app.xlsx_path"].set(str(app.get("xlsx_path", "data/jijin.xlsx")))
         self.vars["app.threshold"].set(str(app.get("threshold", 0.40)))
         self.vars["app.ntfy_url"].set(str(app.get("ntfy_url", "")))
+        self.vars["app.decision_notify"].set(self._parse_bool(app.get("decision_notify", False), default=False))
 
     def _has_unsaved_settings(self) -> bool:
         app = self.saved_app_state or {}
@@ -2967,6 +3056,11 @@ class JijinUI(tk.Tk):
         current_ntfy = self.vars["app.ntfy_url"].get().strip()
         saved_ntfy = str(app.get("ntfy_url", "")).strip()
         if current_ntfy != saved_ntfy:
+            return True
+
+        current_decision_notify = self._parse_bool(self.vars["app.decision_notify"].get(), default=False)
+        saved_decision_notify = self._parse_bool(app.get("decision_notify", False), default=False)
+        if current_decision_notify != saved_decision_notify:
             return True
 
         current_threshold_raw = self.vars["app.threshold"].get().strip() or "0.40"
@@ -3734,7 +3828,7 @@ class JijinUI(tk.Tk):
             self.refresh_fund_view()
             self._save_trade_doc()
 
-        if ntfy_url:
+        if ntfy_url and float(threshold) > 0:
             notify_rows: List[Tuple[str, Dict, float, str]] = []
             for code, (nav_date, latest_nav) in nav_map.items():
                 rows, _ = self.build_display_rows(code, latest_nav)

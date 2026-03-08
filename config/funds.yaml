@@ -1,7 +1,8 @@
 app:
   xlsx_path: data/buy.xlsx
-  threshold: 0.8
+  threshold: 0.5
   ntfy_url: ntfy.sh/jijin_562877716
+  decision_notify: true
 funds:
 - '002001'
 - 005827
